@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --color-ink: #07101b;
+  --color-panel: #0d1724;
+  --color-panel-soft: #101c2a;
+  --color-mint: #6ee7b7;
+  --color-cyan: #67e8f9;
+}
+
+:root {
+  color-scheme: dark;
+  background: #07101b;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --muted: #8290a2;
+  --line: rgba(255, 255, 255, 0.075);
+}
+
+* { box-sizing: border-box; }
+html { min-height: 100%; background: #07101b; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: #e5edf5;
+  background:
+    radial-gradient(ellipse at 52% -25%, rgba(18, 72, 72, 0.2), transparent 42%),
+    radial-gradient(ellipse at 100% 30%, rgba(20, 40, 67, 0.12), transparent 34%),
+    #07101b;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+button, input, select, textarea { font: inherit; }
+::selection { color: #04120c; background: #6ee7b7; }
+
+.surface { position: relative; isolation: isolate; }
+.surface::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  content: "";
+  pointer-events: none;
+  background: linear-gradient(145deg, rgba(255,255,255,.025), transparent 42%);
+}
+.subtle-grid {
+  background-image: linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(to bottom, black, transparent 80%);
+}
+.glass { background: rgba(11, 21, 33, .78); backdrop-filter: blur(18px); }
+.eyebrow { color: #71e7ba; font-size: 10px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
+
+* { scrollbar-width: thin; scrollbar-color: #26394b transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { border-radius: 99px; background: #26394b; }
+
+@keyframes rise-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.animate-rise { animation: rise-in .42s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

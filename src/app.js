@@ -32,6 +32,55 @@ function parseWaitMs(raw, defaultValue) {
   return value <= 25000 ? value : null;
 }
 
+function validatePositionSnapshot(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.positions)) {
+    throw new PayloadValidationError('positions must be an array');
+  }
+  if (body.positions.length > 100) throw new PayloadValidationError('positions cannot contain more than 100 items');
+  return body.positions.map((position, index) => {
+    if (!position || typeof position !== 'object' || Array.isArray(position)) {
+      throw new PayloadValidationError(`positions[${index}] must be an object`);
+    }
+    const ticket = typeof position.ticket === 'string' ? position.ticket : String(position.ticket ?? '');
+    const symbol = typeof position.symbol === 'string' ? position.symbol : '';
+    const side = typeof position.side === 'string' ? position.side.toUpperCase() : '';
+    const currency = typeof position.currency === 'string' ? position.currency.toUpperCase() : '';
+    const volume = position.volume;
+    const openPrice = position.open_price;
+    const currentPnl = position.current_pnl;
+    const magicNumber = position.magic_number;
+    const openedAt = position.opened_at;
+    if (!/^[0-9]{1,32}$/.test(ticket)) throw new PayloadValidationError(`positions[${index}].ticket is invalid`);
+    if (!/^[A-Za-z0-9._#-]{1,32}$/.test(symbol)) throw new PayloadValidationError(`positions[${index}].symbol is invalid`);
+    if (!['BUY', 'SELL'].includes(side)) throw new PayloadValidationError(`positions[${index}].side must be BUY or SELL`);
+    if (typeof volume !== 'number' || !Number.isFinite(volume) || volume <= 0 || volume > 10000) {
+      throw new PayloadValidationError(`positions[${index}].volume is invalid`);
+    }
+    if (typeof openPrice !== 'number' || !Number.isFinite(openPrice) || openPrice <= 0 || openPrice > 1e9) {
+      throw new PayloadValidationError(`positions[${index}].open_price is invalid`);
+    }
+    if (typeof currentPnl !== 'number' || !Number.isFinite(currentPnl) || Math.abs(currentPnl) > 1e9) {
+      throw new PayloadValidationError(`positions[${index}].current_pnl is invalid`);
+    }
+    if (!/^[A-Z]{3}$/.test(currency)) throw new PayloadValidationError(`positions[${index}].currency must be a three-letter code`);
+    if (!Number.isSafeInteger(magicNumber) || magicNumber < 0) throw new PayloadValidationError(`positions[${index}].magic_number is invalid`);
+    if (!Number.isSafeInteger(openedAt) || openedAt < 0 || openedAt > Math.floor(Date.now() / 1000) + 86400) {
+      throw new PayloadValidationError(`positions[${index}].opened_at must be Unix seconds`);
+    }
+    return {
+      ticket,
+      symbol,
+      side,
+      volume,
+      openPrice,
+      currentPnl,
+      currency,
+      magicNumber,
+      openedAt: new Date(openedAt * 1000),
+    };
+  });
+}
+
 function publicUser(user, authService) {
   return authService.toPublicUser(user);
 }
@@ -65,7 +114,7 @@ export function createApp({ config, repository, logger = createLogger(), notifie
     res.setHeader('x-request-id', req.requestId);
     next();
   });
-  app.use(express.json({ limit: '16kb', strict: true, type: 'application/json' }));
+  app.use(express.json({ limit: '64kb', strict: true, type: 'application/json' }));
 
   const requireSession = asyncHandler(async (req, res, next) => {
     const token = bearerFromRequest(req);
@@ -226,6 +275,41 @@ export function createApp({ config, repository, logger = createLogger(), notifie
     return bot ? res.status(200).json({ bot }) : res.status(404).json({ error: 'bot_not_found' });
   }));
 
+  app.post('/api/v1/bots/:id/panic', requireSession, asyncHandler(async (req, res) => {
+    if (!UUID_PATTERN.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const result = await repository.panicBot(req.user.id, req.params.id);
+    if (result.kind === 'not_found') return res.status(404).json({ error: 'bot_not_found' });
+    if (result.kind === 'account_inactive') {
+      return res.status(409).json({ error: 'mt5_account_inactive', message: 'The account bridge must be reactivated before MT5 positions can be closed.' });
+    }
+    const bridgeOnline = Boolean(result.lastSeenAt)
+      && Date.now() - new Date(result.lastSeenAt).getTime() <= config.bridgeStaleMs;
+    logger.warn('panic_command_queued', {
+      request_id: req.requestId,
+      user_id: req.user.id,
+      bot_id: req.params.id,
+      mt5_account_id: result.accountId,
+      job_id: result.id,
+      bridge_online: bridgeOnline,
+    });
+    notifier.notify(result.accountId);
+    return res.status(202).json({
+      accepted: true,
+      id: result.id,
+      status: result.status,
+      bridge_online: bridgeOnline,
+      message: bridgeOnline
+        ? 'All bots on this MT5 account are paused. The EA will close positions managed by its magic number and remove itself after acknowledgement.'
+        : 'All bots on this MT5 account are paused. The panic close is queued, but MT5 is offline; positions will not close until the EA reconnects.',
+    });
+  }));
+
+  app.get('/api/v1/dashboard/overview', requireSession, asyncHandler(async (req, res) => {
+    const overview = await repository.getDashboardOverview(req.user.id);
+    if (!overview) return res.status(404).json({ error: 'user_not_found' });
+    return res.status(200).json(overview);
+  }));
+
   app.get('/api/v1/subscriptions', requireSession, asyncHandler(async (req, res) => {
     const subscriptions = await repository.listSubscriptions(req.user.id);
     return res.status(200).json({ subscriptions });
@@ -275,6 +359,15 @@ export function createApp({ config, repository, logger = createLogger(), notifie
       id: queued.id,
       status: queued.status,
     });
+  }));
+
+  app.post('/api/v1/mt5/positions/sync', asyncHandler(async (req, res) => {
+    const account = await authenticateBridge(req, res);
+    if (!account) return;
+    const positions = validatePositionSnapshot(req.body || {});
+    const result = await repository.syncMt5Positions(account.id, account.user_id, positions);
+    if (result.kind === 'not_found') return res.status(409).json({ error: 'mt5_account_inactive' });
+    return res.status(200).json({ synced: true, position_count: result.count });
   }));
 
   app.get('/api/v1/mt5/commands/next', asyncHandler(async (req, res) => {

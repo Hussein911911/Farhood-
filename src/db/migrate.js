@@ -52,10 +52,11 @@ export async function assertSchemaReady(pool) {
   const result = await pool.query(`
     SELECT to_regclass('public.users') AS users,
            to_regclass('public.execution_commands') AS execution_commands,
+           to_regclass('public.mt5_positions') AS mt5_positions,
            to_regclass('public.schema_migrations') AS schema_migrations
   `);
   const row = result.rows[0];
-  if (!row?.users || !row?.execution_commands || !row?.schema_migrations) {
+  if (!row?.users || !row?.execution_commands || !row?.mt5_positions || !row?.schema_migrations) {
     throw new Error('Database schema is not initialized. Run `npm run db:migrate` first.');
   }
 }

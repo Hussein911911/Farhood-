@@ -142,10 +142,10 @@ This command is disabled when `NODE_ENV=production`. It updates the user's curre
    - `InpBridgeId` and `InpBridgeKey`: the credentials returned once when creating the MT5 account
    - `InpMagic`: keep the default or assign a dedicated positive number
    - `InpAllowLiveAccount`: leave **false** for demo tests. The EA refuses non-demo account types unless this explicit opt-in is changed.
-   - Keep `InpServerWaitMs=20000` and `InpHttpTimeoutMs=30000` initially.
-5. Confirm the terminal is connected, broker symbols are in Market Watch, and the **Experts** tab reports successful polling.
+   - Keep `InpServerWaitMs=20000`, `InpHttpTimeoutMs=30000`, and `InpStateSyncSeconds=15` initially.
+5. Confirm the terminal is connected, broker symbols are in Market Watch, and the **Experts** tab reports successful polling and position snapshots.
 
-The account-specific bridge key is different from the user's TradingView API key. Do not put `bridge_key` in Pine Script. A `CLOSE` command only closes positions for that MT5 symbol and the EA's `InpMagic` value.
+The account-specific bridge key is different from the user's TradingView API key. Do not put `bridge_key` in Pine Script. A normal `CLOSE` command only closes positions for that MT5 symbol and the EA's `InpMagic` value. The Phase 3 dashboard uses `/api/v1/mt5/positions/sync` snapshots for EA-managed positions; these update approximately every 15 seconds and are not a broker-side streaming feed.
 
 ## 6. Send a direct webhook test
 
@@ -209,16 +209,19 @@ The sample strategy sends `CLOSE` before a reversal entry and uses long-polling 
 
 ## 8. Schema, risk, and fee behavior
 
-Migration `001_phase2_core.sql` creates:
+Migration `001_phase2_core.sql` creates the Phase 2 core tables; `002_phase3_dashboard.sql` adds:
 
-- `users`, `subscriptions`, `user_sessions`, `api_keys`
-- `mt5_accounts`, `bots_config`
-- `execution_commands` (persistent leased MT5 queue)
-- `trade_logs` (one record per broker fill/command)
+- `mt5_positions` (latest account-scoped EA-managed position snapshots)
+- A priority field for execution commands and the internal `PANIC` action
+- Nullable API-key linkage for trusted system-generated emergency commands
+
+The core tables are `users`, `subscriptions`, `user_sessions`, `api_keys`, `mt5_accounts`, `bots_config`, `execution_commands` (persistent leased MT5 queue), and `trade_logs` (broker-confirmed fills).
 
 The user `subscription_tier` is a materialized current tier; a qualifying `ACTIVE`/unexpired `TRIAL` subscription must also exist and match the tier. Subscription payment lifecycle is intentionally external to this phase.
 
 `max_daily_drawdown` is compared with the bot's realized **net USD P/L since 00:00 UTC**. New `BUY`/`SELL` signals are blocked once drawdown reaches its configured limit. This is not an intraday equity monitor and cannot see unrealized floating loss. If `news_filter_enabled` is true, commands are rejected until an actual news-calendar provider is integrated.
+
+The Phase 3 UI exposes an account-wide panic action: it disables every bot on the selected account, fails queued (unclaimed) commands, then inserts a high-priority internal `PANIC` command. The EA attempts to close positions matching its configured `InpMagic` across symbols and removes itself only after the close requests succeed and the API acknowledges the result. Claimed broker orders cannot be recalled; an offline EA leaves the panic queued, and broker rejection remains possible. Verify the terminal directly.
 
 The EA reports deal P/L in its MT5 account currency. For `CLOSE` fills denominated in USD, the server deducts `min(wallet_balance, max(profit_loss, 0) * performance_fee_rate)` in the same PostgreSQL transaction that records the trade. Opening fills are logged with zero realized P/L/fee. Non-USD P/L is logged with its currency but is not converted or charged; use USD demo accounts for fee verification.
 
@@ -228,7 +231,7 @@ The EA reports deal P/L in its MT5 account currency. For `CLOSE` fills denominat
 npm test
 ```
 
-The integration suite executes the SQL migration and exercises session creation, encrypted MT5 account storage, one-time API-key hashing, webhook authorization, subscription/wallet rejection, bot lot limits, account-specific command polling, trade-log recording, and fee deduction against PGlite.
+The integration suite executes both SQL migrations and exercises session creation, encrypted MT5 account storage, one-time API-key hashing, webhook authorization, subscription/wallet rejection, bot lot limits, account-specific command polling, position snapshot isolation, prioritized panic delivery, trade-log recording, and fee deduction against PGlite.
 
 Common issues:
 

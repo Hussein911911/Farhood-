@@ -6,7 +6,7 @@ import { runMigrations } from '../src/db/migrate.js';
 import { PostgresRepository } from '../src/db/postgres-repository.js';
 import { ApiKeyService } from '../src/services/api-key-service.js';
 import { Mt5AccountService } from '../src/services/mt5-account-service.js';
-import { hashApiKey, hashSessionToken } from '../src/security/secrets.js';
+import { generateSessionToken, hashApiKey, hashSessionToken } from '../src/security/secrets.js';
 import { decryptMt5InvestorPassword } from '../src/security/encryption.js';
 import { createTestPool } from '../test-support/pglite-pool.js';
 
@@ -115,6 +115,16 @@ async function provisionUser({ subscriptionStatus = 'ACTIVE', walletBalance = 10
   const apiKeys = new ApiKeyService({ repository, apiKeyPepper });
   const apiKey = await apiKeys.createForUser(user.id, { botId: bot.id });
   return { user, account, bot, apiKey };
+}
+
+async function createSessionForUser(userId) {
+  const token = generateSessionToken();
+  await repository.createSession({
+    userId,
+    tokenHash: hashSessionToken(token, sessionPepper),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+  });
+  return token;
 }
 
 function webhookPayload(secretKey, overrides = {}) {
@@ -324,4 +334,87 @@ test('routes commands to the owning MT5 account and rotates bridge credentials o
   assert.notEqual(rotated.account.bridge_id, first.account.bridge_id);
   assert.equal((await nextCommand(first.account, first.account.bridge_key)).status, 401);
   assert.equal((await nextCommand(rotated.account, rotated.bridge_key)).status, 204);
+});
+
+test('syncs MT5-managed positions into dashboard metrics without exposing other users data', async () => {
+  const first = await provisionUser();
+  const second = await provisionUser();
+  const firstToken = await createSessionForUser(first.user.id);
+  const secondToken = await createSessionForUser(second.user.id);
+
+  const snapshot = await request('/api/v1/mt5/positions/sync', jsonOptions({
+    positions: [{
+      ticket: '12345001', symbol: 'EURUSDm', side: 'BUY', volume: 0.1,
+      open_price: 1.08, current_pnl: 12.34, currency: 'USD', magic_number: 26100801,
+      opened_at: Math.floor(Date.now() / 1000) - 120,
+    }],
+  }, bridgeHeaders(first.account, first.account.bridge_key)));
+  assert.equal(snapshot.status, 200);
+  assert.equal((await snapshot.json()).position_count, 1);
+
+  const firstOverviewResponse = await request('/api/v1/dashboard/overview', {
+    headers: { authorization: `Bearer ${firstToken}` },
+  });
+  assert.equal(firstOverviewResponse.status, 200);
+  const firstOverview = await firstOverviewResponse.json();
+  assert.equal(firstOverview.metrics.open_positions, 1);
+  assert.equal(firstOverview.metrics.active_pnl_by_currency.USD, 12.34);
+  assert.equal(firstOverview.positions[0].ticket, '12345001');
+
+  const secondOverview = await (await request('/api/v1/dashboard/overview', {
+    headers: { authorization: `Bearer ${secondToken}` },
+  })).json();
+  assert.equal(secondOverview.metrics.open_positions, 0);
+  assert.deepEqual(secondOverview.positions, []);
+
+  const emptySnapshot = await request('/api/v1/mt5/positions/sync', jsonOptions({ positions: [] }, bridgeHeaders(first.account, first.account.bridge_key)));
+  assert.equal(emptySnapshot.status, 200);
+  const refreshed = await (await request('/api/v1/dashboard/overview', {
+    headers: { authorization: `Bearer ${firstToken}` },
+  })).json();
+  assert.equal(refreshed.metrics.open_positions, 0);
+});
+
+test('panic switch pauses all account bots, prioritizes a close command, and records no synthetic fill', async () => {
+  const fixture = await provisionUser();
+  const sessionToken = await createSessionForUser(fixture.user.id);
+  const sessionHeaders = { authorization: `Bearer ${sessionToken}` };
+
+  const queued = await request('/api/v1/webhook', jsonOptions(webhookPayload(fixture.apiKey.secret_key, {
+    signal_id: 'cancel-before-panic',
+  })));
+  assert.equal(queued.status, 202);
+
+  const panicResponse = await request(`/api/v1/bots/${fixture.bot.id}/panic`, jsonOptions({}, sessionHeaders));
+  assert.equal(panicResponse.status, 202);
+  const panic = await panicResponse.json();
+  assert.equal(panic.status, 'QUEUED');
+  const prematureResume = await request(`/api/v1/bots/${fixture.bot.id}`, {
+    method: 'PATCH',
+    headers: { ...sessionHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ is_active: true }),
+  });
+  assert.equal(prematureResume.status, 409);
+  assert.equal((await prematureResume.json()).error, 'panic_pending');
+
+  const poll = await nextCommand(fixture.account, fixture.account.bridge_key);
+  assert.equal(poll.status, 200);
+  const command = await poll.json();
+  assert.equal(command.action, 'PANIC');
+  assert.equal(command.symbol, '*');
+
+  const botRow = await pool.query('SELECT is_active FROM bots_config WHERE id = $1', [fixture.bot.id]);
+  assert.equal(botRow.rows[0].is_active, false);
+  const cancelled = await pool.query(
+    "SELECT status FROM execution_commands WHERE idempotency_key = 'cancel-before-panic'",
+  );
+  assert.equal(cancelled.rows[0].status, 'FAILED');
+
+  const ack = await sendResult(fixture.account, fixture.account.bridge_key, command, {
+    order: '0', deal: '0', executed_lot: 0, profit_loss: 0,
+  });
+  assert.equal(ack.status, 200);
+  assert.equal((await ack.json()).trade_logged, false);
+  const logCount = await pool.query('SELECT COUNT(*)::int AS count FROM trade_logs WHERE user_id = $1', [fixture.user.id]);
+  assert.equal(logCount.rows[0].count, 0);
 });

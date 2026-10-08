@@ -11,6 +11,7 @@ input long   InpMagic               = 26100801;
 input int    InpDeviationPoints     = 20;
 input int    InpServerWaitMs        = 20000;
 input int    InpHttpTimeoutMs       = 30000;
+input int    InpStateSyncSeconds    = 15;
 input bool   InpAllowLiveAccount    = false; // Explicit opt-in; keep false for all demo verification.
 input bool   InpLogDetails          = true;
 
@@ -29,6 +30,9 @@ struct TradeOutcome
 
 string g_baseUrl = "";
 bool   g_polling = false;
+ulong  g_lastPositionSyncMs = 0;
+
+void SyncOpenPositions();
 
 bool IsValidBridgeId(const string value)
   {
@@ -103,6 +107,11 @@ int OnInit()
       Print("TradingViewBridgeEA: InpHttpTimeoutMs should be greater than InpServerWaitMs.");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpStateSyncSeconds < 5 || InpStateSyncSeconds > 300)
+     {
+      Print("TradingViewBridgeEA: InpStateSyncSeconds must be between 5 and 300.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    g_baseUrl = InpBaseUrl;
    if(StringSubstr(g_baseUrl, StringLen(g_baseUrl) - 1, 1) == "/")
@@ -124,6 +133,12 @@ void OnTimer()
    if(g_polling)
       return;
    g_polling = true;
+   ulong nowMs = GetTickCount64();
+   if(g_lastPositionSyncMs == 0 || nowMs - g_lastPositionSyncMs >= (ulong)InpStateSyncSeconds * 1000)
+     {
+      g_lastPositionSyncMs = nowMs;
+      SyncOpenPositions();
+     }
    PollForCommand();
    g_polling = false;
   }
@@ -283,6 +298,50 @@ string JsonEscape(const string value)
       else escaped += StringSubstr(value, index, 1);
      }
    return escaped;
+  }
+
+void SyncOpenPositions()
+  {
+   string body = "{\"positions\":[";
+   int count = 0;
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+     {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+      if(count >= 100)
+        {
+         Print("TradingViewBridgeEA: more than 100 managed positions; dashboard snapshot skipped to avoid a partial state.");
+         return;
+        }
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      string side = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL";
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      long magicNumber = PositionGetInteger(POSITION_MAGIC);
+      long openedAt = PositionGetInteger(POSITION_TIME);
+      if(count > 0)
+         body += ",";
+      body += StringFormat(
+         "{\"ticket\":\"%I64u\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":%s,\"open_price\":%s,\"current_pnl\":%s,\"currency\":\"%s\",\"magic_number\":%I64d,\"opened_at\":%I64d}",
+         ticket, JsonEscape(symbol), side, DoubleToString(volume, 4), DoubleToString(openPrice, 8),
+         DoubleToString(currentPnl, 2), JsonEscape(AccountInfoString(ACCOUNT_CURRENCY)), magicNumber, openedAt);
+      count++;
+     }
+   body += "]}";
+
+   char response[];
+   string responseHeaders = "";
+   int httpStatus = HttpCall("POST", "/api/v1/mt5/positions/sync", body, response, responseHeaders);
+   if(httpStatus != 200)
+      Print("TradingViewBridgeEA: position snapshot returned HTTP ", httpStatus,
+            "; response=", ResponseText(response), "; error=", GetLastError());
+   else if(InpLogDetails)
+      Print("TradingViewBridgeEA: synchronized ", count, " managed open position(s) for the dashboard.");
   }
 
 void ResetOutcome(TradeOutcome &outcome)
@@ -618,12 +677,102 @@ void ExecuteClose(const string id, const string symbol, TradeOutcome &outcome)
       outcome.message = StringFormat("Accepted %d of %d close request(s); %s", closed, matched, failures);
   }
 
+void ExecutePanicClose(const string id, TradeOutcome &outcome)
+  {
+   ResetOutcome(outcome);
+   string reason = "";
+   if(!TradingAvailable(reason))
+     {
+      outcome.message = reason;
+      return;
+     }
+
+   int matched = 0;
+   int fullyClosed = 0;
+   string failures = "";
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+     {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+
+      matched++;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      if(!SymbolSelect(symbol, true))
+        {
+         failures += StringFormat("ticket %I64u: cannot select %s; ", ticket, symbol);
+         continue;
+        }
+      ENUM_POSITION_TYPE positionType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      MqlTick tick;
+      if(!SymbolInfoTick(symbol, tick))
+        {
+         failures += StringFormat("ticket %I64u: no current quote; ", ticket);
+         continue;
+        }
+
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      request.action = TRADE_ACTION_DEAL;
+      request.position = ticket;
+      request.symbol = symbol;
+      request.volume = volume;
+      request.type = positionType == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      request.price = positionType == POSITION_TYPE_BUY ? tick.bid : tick.ask;
+      request.deviation = InpDeviationPoints;
+      request.magic = InpMagic;
+      request.type_filling = FillingMode(symbol);
+      request.comment = CommandComment(id, "PANIC");
+
+      ResetLastError();
+      bool sent = OrderSend(request, result);
+      if(sent && IsAcceptedRetcode(result.retcode))
+        {
+         outcome.retcode = result.retcode;
+         outcome.order = result.order;
+         outcome.deal = result.deal;
+         outcome.price = result.price;
+         if(result.deal > 0)
+           {
+            outcome.executedLot += result.volume > 0.0 ? result.volume : volume;
+            outcome.profitLoss += RealizedDealNet(result.deal);
+           }
+         if(!PositionSelectByTicket(ticket))
+            fullyClosed++;
+         else
+            failures += StringFormat("ticket %I64u remains open after a partial close; ", ticket);
+        }
+      else
+        {
+         failures += StringFormat("ticket %I64u retcode %u (%s); ", ticket, result.retcode, result.comment);
+         outcome.retcode = result.retcode;
+        }
+     }
+
+   if(matched == 0)
+     {
+      outcome.success = true;
+      outcome.retcode = TRADE_RETCODE_DONE;
+      outcome.message = "No open positions managed by this EA magic number";
+      return;
+     }
+
+   outcome.success = (fullyClosed == matched);
+   if(outcome.success)
+      outcome.message = StringFormat("Panic close accepted for all %d EA-managed position(s)", fullyClosed);
+   else
+      outcome.message = StringFormat("Panic close completed for %d of %d position(s); %s", fullyClosed, matched, failures);
+  }
+
 string DedupeVariableName(const string id)
   {
    return "TVBridge_" + StringSubstr(id, 0, 45);
   }
 
-void SendResult(const string id, const string leaseToken, const TradeOutcome &outcome)
+bool SendResult(const string id, const string leaseToken, const TradeOutcome &outcome)
   {
    string successText = outcome.success ? "true" : "false";
    string priceText = outcome.price > 0.0 ? DoubleToString(outcome.price, 8) : "null";
@@ -648,6 +797,7 @@ void SendResult(const string id, const string leaseToken, const TradeOutcome &ou
    else if(InpLogDetails)
       Print("TradingViewBridgeEA: execution result acknowledged for ", id,
             " (success=", outcome.success, ", retcode=", outcome.retcode, ").");
+   return httpStatus == 200;
   }
 
 void HandleCommand(const string commandJson)
@@ -670,7 +820,9 @@ void HandleCommand(const string commandJson)
       duplicate.success = true;
       duplicate.retcode = TRADE_RETCODE_DONE;
       duplicate.message = "Duplicate command already processed by this terminal; not resent to broker";
-      SendResult(id, leaseToken, duplicate);
+      bool duplicateAcknowledged = SendResult(id, leaseToken, duplicate);
+      if(action == "PANIC" && duplicateAcknowledged)
+         ExpertRemove();
       return;
      }
 
@@ -684,6 +836,8 @@ void HandleCommand(const string commandJson)
      }
    else if(action == "CLOSE")
       ExecuteClose(id, symbol, outcome);
+   else if(action == "PANIC")
+      ExecutePanicClose(id, outcome);
    else
      {
       ResetOutcome(outcome);
@@ -700,5 +854,10 @@ void HandleCommand(const string commandJson)
    if(InpLogDetails || !outcome.success)
       Print("TradingViewBridgeEA: ", action, " ", symbol, " => ", outcome.success,
             "; retcode=", outcome.retcode, "; ", outcome.message);
-   SendResult(id, leaseToken, outcome);
+   bool acknowledged = SendResult(id, leaseToken, outcome);
+   if(action == "PANIC" && outcome.success && acknowledged)
+     {
+      Print("TradingViewBridgeEA: panic command acknowledged; removing EA from chart.");
+      ExpertRemove();
+     }
   }

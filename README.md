@@ -53,11 +53,30 @@ See **[Phase 2 database and end-to-end setup](docs/PHASE-2-SETUP.md)** for local
 | `POST` | `/api/v1/mt5-accounts/:id/rotate-bridge-key` | Session | Rotate per-account bridge credentials when no command is in flight |
 | `POST` | `/api/v1/mt5-accounts/:id/activate` | Session | Reactivate a disabled account with fresh bridge credentials |
 | `POST`, `GET`, `PATCH` | `/api/v1/bots` | Session | Create/list/update bot risk configuration |
+| `POST` | `/api/v1/bots/:id/panic` | Session | Pause all account bots and queue priority EA-managed closes |
+| `GET` | `/api/v1/dashboard/overview` | Session | Dashboard metrics, accounts, positions, and recent fills |
 | `GET` | `/api/v1/subscriptions` | Session | View subscription history |
 | `GET` | `/api/v1/trade-logs` | Session | Paginated trade history |
+| `POST` | `/api/v1/mt5/positions/sync` | Per-account bridge bearer key | Replace the EA-managed position snapshot |
 | `POST` | `/api/v1/webhook` | User API key in `secret_key` | Validate subscription, wallet, bot and enqueue order |
 | `GET` | `/api/v1/mt5/commands/next` | Per-account bridge bearer key | EA long-polls its own queue |
 | `POST` | `/api/v1/mt5/commands/:id/result` | Per-account bridge bearer key | Confirm broker result and persist trade/fee |
 | `GET` | `/healthz`, `/readyz` | Public | Liveness and database/bridge readiness |
 
 The response statuses for webhook validation include `202` accepted, `200` duplicate signal, `401` invalid key, `402` insufficient wallet, `403` inactive subscription/risk policy, `409` reused idempotency key with different content, and `503` full queue or unavailable configured news provider.
+
+## Phase 3 dashboard
+
+The Next.js 16 App Router application in [`web/`](web/) adds a secure browser dashboard with cookie-backed sessions, MT5 account setup, API-key management, bot risk controls, EA position/P&L snapshots, an account-scoped panic switch, a demonstration strategy catalog, and an interactive onboarding guide at `/docs`.
+
+Start the Express API from the repository root, then in another terminal:
+
+```sh
+cd web
+npm install
+cp .env.example .env.local
+# Set BACKEND_API_URL to the server-side Express API origin.
+npm run dev
+```
+
+Open <http://localhost:3001>. See [`docs/PHASE-3-SETUP.md`](docs/PHASE-3-SETUP.md) for deployment and feature boundaries. The catalog's stats/prices are illustrative, checkout is not connected, and strategy attachment only creates a bot configuration. The Panic switch requires an online MT5 EA to execute and acknowledge closures; always verify directly in the terminal.

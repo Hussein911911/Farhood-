@@ -40,6 +40,22 @@ function toPublicBot(row) {
   };
 }
 
+function toPublicPosition(row) {
+  return {
+    ticket: row.ticket,
+    mt5_account_id: row.mt5_account_id,
+    symbol: row.symbol,
+    side: row.side,
+    volume: Number(row.volume),
+    open_price: Number(row.open_price),
+    current_pnl: Number(row.current_pnl),
+    pnl_currency: row.pnl_currency,
+    magic_number: String(row.magic_number),
+    opened_at: row.opened_at,
+    synced_at: row.synced_at,
+  };
+}
+
 export class PostgresRepository {
   constructor(pool) {
     this.pool = pool;
@@ -199,6 +215,14 @@ export class PostgresRepository {
     return this.transaction(async (tx) => tx.activateMt5Account(userId, accountId, credential));
   }
 
+  async panicBot(userId, botId) {
+    return this.transaction(async (tx) => tx.panicBot(userId, botId));
+  }
+
+  async syncMt5Positions(accountId, userId, positions) {
+    return this.transaction(async (tx) => tx.syncMt5Positions(accountId, userId, positions));
+  }
+
   async createBotConfig(bot) {
     const result = await this.pool.query(
       `INSERT INTO bots_config
@@ -224,25 +248,7 @@ export class PostgresRepository {
   }
 
   async updateBotConfig(userId, botId, patch) {
-    const columns = {
-      botName: 'bot_name',
-      maxDailyDrawdown: 'max_daily_drawdown',
-      maxLotSize: 'max_lot_size',
-      newsFilterEnabled: 'news_filter_enabled',
-      performanceFeeRate: 'performance_fee_rate',
-      isActive: 'is_active',
-    };
-    const entries = Object.entries(patch);
-    const assignments = entries.map(([key], index) => `${columns[key]} = $${index + 3}`);
-    const values = entries.map(([, value]) => value);
-    const result = await this.pool.query(
-      `UPDATE bots_config SET ${assignments.join(', ')}, updated_at = now()
-       WHERE id = $1 AND user_id = $2
-       RETURNING id, user_id, mt5_account_id, bot_name, max_daily_drawdown, max_lot_size,
-                 news_filter_enabled, performance_fee_rate, is_active, created_at, updated_at`,
-      [botId, userId, ...values],
-    );
-    return result.rows[0] ? toPublicBot(result.rows[0]) : null;
+    return this.transaction(async (tx) => tx.updateBotConfig(userId, botId, patch));
   }
 
   async listSubscriptions(userId) {
@@ -272,6 +278,82 @@ export class PostgresRepository {
     }));
   }
 
+  async listOpenPositions(userId) {
+    const result = await this.pool.query(
+      `SELECT p.ticket, p.mt5_account_id, p.symbol, p.side, p.volume, p.open_price,
+              p.current_pnl, p.pnl_currency, p.magic_number, p.opened_at, p.synced_at
+       FROM mt5_positions p
+       JOIN mt5_accounts a ON a.id = p.mt5_account_id AND a.user_id = p.user_id
+       WHERE p.user_id = $1 AND a.is_active = TRUE
+       ORDER BY p.opened_at DESC, p.ticket`,
+      [userId],
+    );
+    return result.rows.map(toPublicPosition);
+  }
+
+  async getDashboardOverview(userId) {
+    const [userResult, subscriptionResult, accounts, bots, positions, tradeTotals, realizedRows, recentTradeLogs] = await Promise.all([
+      this.pool.query(
+        `SELECT id, email, subscription_tier, wallet_balance, created_at
+         FROM users WHERE id = $1`,
+        [userId],
+      ),
+      this.pool.query(
+        `SELECT id, tier, status, starts_at, ends_at, provider, created_at
+         FROM subscriptions WHERE user_id = $1
+           AND status IN ('TRIAL', 'ACTIVE') AND starts_at <= now()
+           AND (ends_at IS NULL OR ends_at > now())
+         ORDER BY starts_at DESC LIMIT 1`,
+        [userId],
+      ),
+      this.listMt5Accounts(userId),
+      this.listBotConfigs(userId),
+      this.listOpenPositions(userId),
+      this.pool.query(
+        `SELECT COUNT(*)::int AS total_trades_executed,
+                COUNT(*) FILTER (WHERE profit_loss > 0)::int AS winning_trades,
+                COUNT(*) FILTER (WHERE profit_loss < 0)::int AS losing_trades
+         FROM trade_logs WHERE user_id = $1`,
+        [userId],
+      ),
+      this.pool.query(
+        `SELECT profit_loss_currency AS currency, COALESCE(SUM(profit_loss), 0) AS pnl
+         FROM trade_logs WHERE user_id = $1 GROUP BY profit_loss_currency ORDER BY profit_loss_currency`,
+        [userId],
+      ),
+      this.listTradeLogs(userId, { limit: 8, offset: 0 }),
+    ]);
+
+    const user = userResult.rows[0];
+    if (!user) return null;
+    const activePnlByCurrency = {};
+    for (const position of positions) {
+      activePnlByCurrency[position.pnl_currency] = (activePnlByCurrency[position.pnl_currency] || 0) + position.current_pnl;
+    }
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        subscription_tier: user.subscription_tier,
+        wallet_balance: Number(user.wallet_balance),
+        created_at: user.created_at,
+      },
+      subscription: subscriptionResult.rows[0] ?? null,
+      accounts,
+      bots,
+      positions,
+      metrics: {
+        total_trades_executed: Number(tradeTotals.rows[0]?.total_trades_executed || 0),
+        winning_trades: Number(tradeTotals.rows[0]?.winning_trades || 0),
+        losing_trades: Number(tradeTotals.rows[0]?.losing_trades || 0),
+        open_positions: positions.length,
+        active_pnl_by_currency: activePnlByCurrency,
+        realized_pnl_by_currency: Object.fromEntries(realizedRows.rows.map((row) => [row.currency, Number(row.pnl)])),
+      },
+      recent_trade_logs: recentTradeLogs,
+    };
+  }
+
   async authenticateBridge(bridgeId, bridgeKeyHash) {
     const result = await this.pool.query(
       `UPDATE mt5_accounts
@@ -295,6 +377,134 @@ export class PostgresRepository {
 class PostgresTransaction {
   constructor(client) {
     this.client = client;
+  }
+
+  async updateBotConfig(userId, botId, patch) {
+    const bot = await this.client.query(
+      `SELECT id, mt5_account_id FROM bots_config WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+      [botId, userId],
+    );
+    if (!bot.rows[0]) return null;
+    if (patch.isActive === true) {
+      const panic = await this.client.query(
+        `SELECT 1 FROM execution_commands
+         WHERE mt5_account_id = $1 AND action = 'PANIC' AND status IN ('QUEUED', 'CLAIMED')
+         LIMIT 1`,
+        [bot.rows[0].mt5_account_id],
+      );
+      if (panic.rows.length > 0) return { kind: 'panic_pending' };
+    }
+    const columns = {
+      botName: 'bot_name',
+      maxDailyDrawdown: 'max_daily_drawdown',
+      maxLotSize: 'max_lot_size',
+      newsFilterEnabled: 'news_filter_enabled',
+      performanceFeeRate: 'performance_fee_rate',
+      isActive: 'is_active',
+    };
+    const entries = Object.entries(patch);
+    const assignments = entries.map(([key], index) => `${columns[key]} = $${index + 3}`);
+    const values = entries.map(([, value]) => value);
+    const result = await this.client.query(
+      `UPDATE bots_config SET ${assignments.join(', ')}, updated_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, user_id, mt5_account_id, bot_name, max_daily_drawdown, max_lot_size,
+                 news_filter_enabled, performance_fee_rate, is_active, created_at, updated_at`,
+      [botId, userId, ...values],
+    );
+    return result.rows[0] ? toPublicBot(result.rows[0]) : null;
+  }
+
+  async syncMt5Positions(accountId, userId, positions) {
+    const account = await this.client.query(
+      `SELECT id FROM mt5_accounts WHERE id = $1 AND user_id = $2 AND is_active = TRUE FOR UPDATE`,
+      [accountId, userId],
+    );
+    if (!account.rows[0]) return { kind: 'not_found' };
+    await this.client.query('DELETE FROM mt5_positions WHERE mt5_account_id = $1', [accountId]);
+    for (const position of positions) {
+      await this.client.query(
+        `INSERT INTO mt5_positions
+           (user_id, mt5_account_id, ticket, symbol, side, volume, open_price,
+            current_pnl, pnl_currency, magic_number, opened_at, synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())`,
+        [userId, accountId, position.ticket, position.symbol, position.side, position.volume,
+          position.openPrice, position.currentPnl, position.currency, position.magicNumber,
+          position.openedAt],
+      );
+    }
+    return { kind: 'synced', count: positions.length };
+  }
+
+  async panicBot(userId, botId) {
+    const botResult = await this.client.query(
+      `SELECT b.id AS bot_id, b.mt5_account_id, a.is_active AS account_is_active,
+              a.connection_status, a.last_seen_at
+       FROM bots_config b
+       JOIN mt5_accounts a ON a.id = b.mt5_account_id AND a.user_id = b.user_id
+       WHERE b.id = $1 AND b.user_id = $2
+       FOR UPDATE OF b, a`,
+      [botId, userId],
+    );
+    const bot = botResult.rows[0];
+    if (!bot) return { kind: 'not_found' };
+
+    await this.client.query(
+      `UPDATE bots_config SET is_active = FALSE, updated_at = now()
+       WHERE user_id = $1 AND mt5_account_id = $2`,
+      [userId, bot.mt5_account_id],
+    );
+    await this.client.query(
+      `UPDATE execution_commands
+       SET status = 'FAILED',
+           result_json = $2::jsonb,
+           claimed_by = NULL, lease_token = NULL, lease_until = NULL, updated_at = now()
+       WHERE mt5_account_id = $1 AND status = 'QUEUED' AND action <> 'PANIC'`,
+      [bot.mt5_account_id, JSON.stringify({ success: false, message: 'Superseded by emergency panic command' })],
+    );
+    if (!bot.account_is_active) return { kind: 'account_inactive', accountId: bot.mt5_account_id };
+
+    const existingPanic = await this.client.query(
+      `SELECT id, status FROM execution_commands
+       WHERE mt5_account_id = $1 AND action = 'PANIC' AND status IN ('QUEUED', 'CLAIMED')
+       ORDER BY received_at DESC LIMIT 1`,
+      [bot.mt5_account_id],
+    );
+    if (existingPanic.rows[0]) {
+      return {
+        kind: 'pending',
+        id: existingPanic.rows[0].id,
+        status: existingPanic.rows[0].status,
+        accountId: bot.mt5_account_id,
+        lastSeenAt: bot.last_seen_at,
+      };
+    }
+
+    const commandId = randomUUID();
+    const idempotencyKey = `panic-${randomUUID()}`;
+    const payload = {
+      signal_id: idempotencyKey,
+      action: 'PANIC',
+      source_symbol: '*',
+      symbol: '*',
+      lot: 0,
+      bot_id: bot.bot_id,
+    };
+    await this.client.query(
+      `INSERT INTO execution_commands
+         (id, user_id, api_key_id, bot_id, mt5_account_id, idempotency_key, action,
+          source_symbol, symbol, lot, performance_fee_rate, payload, priority)
+       VALUES ($1,$2,NULL,$3,$4,$5,'PANIC','*','*',0,0,$6::jsonb,100)`,
+      [commandId, userId, bot.bot_id, bot.mt5_account_id, idempotencyKey, JSON.stringify(payload)],
+    );
+    await this.client.query("SELECT pg_notify('farhood_execution_commands', $1)", [bot.mt5_account_id]);
+    return {
+      kind: 'pending',
+      id: commandId,
+      status: 'QUEUED',
+      accountId: bot.mt5_account_id,
+      lastSeenAt: bot.last_seen_at,
+    };
   }
 
   async rotateMt5BridgeCredential(userId, accountId, credential) {
@@ -357,6 +567,7 @@ class PostgresTransaction {
        WHERE mt5_account_id = $1 AND status = 'QUEUED'`,
       [accountId, JSON.stringify({ success: false, message: 'MT5 account deactivated before execution' })],
     );
+    await this.client.query('DELETE FROM mt5_positions WHERE mt5_account_id = $1', [accountId]);
     const result = await this.client.query(
       `UPDATE mt5_accounts SET is_active = FALSE, connection_status = 'DISCONNECTED',
               last_seen_at = NULL, updated_at = now()
@@ -535,7 +746,7 @@ class PostgresTransaction {
               stop_loss_type, take_profit_type, received_at, attempt_count
        FROM execution_commands
        WHERE mt5_account_id = $1 AND status = 'QUEUED'
-       ORDER BY received_at, id
+       ORDER BY priority DESC, received_at, id
        LIMIT 1 FOR UPDATE SKIP LOCKED`,
       [accountId],
     );
@@ -604,7 +815,10 @@ class PostgresTransaction {
     let feeDeducted = 0;
     let walletBalanceAfter = null;
     const executedLot = Number(result.executed_lot || 0);
-    const hasBrokerFill = Boolean(result.deal) && executedLot > 0;
+    const hasBrokerFill = command.action !== 'PANIC' && Boolean(result.deal) && executedLot > 0;
+    if (command.action === 'PANIC' && result.success) {
+      await this.client.query('DELETE FROM mt5_positions WHERE mt5_account_id = $1', [command.mt5_account_id]);
+    }
     if (hasBrokerFill) {
       const userResult = await this.client.query(
         `SELECT wallet_balance FROM users WHERE id = $1 FOR UPDATE`,

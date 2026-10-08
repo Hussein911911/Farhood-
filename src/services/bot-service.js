@@ -64,7 +64,14 @@ export class BotService {
       patch.isActive = input.is_active;
     }
     if (Object.keys(patch).length === 0) throw badRequest('at least one bot field must be supplied');
-    return this.repository.updateBotConfig(userId, botId, patch);
+    const result = await this.repository.updateBotConfig(userId, botId, patch);
+    if (result?.kind === 'panic_pending') {
+      throw Object.assign(new Error('Wait for the account panic command to finish before reactivating this bot'), {
+        statusCode: 409,
+        code: 'panic_pending',
+      });
+    }
+    return result;
   }
 
   listForUser(userId) {
