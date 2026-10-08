@@ -9,7 +9,7 @@ export class BotService {
     const botName = typeof input.bot_name === 'string' ? input.bot_name.trim() : '';
     const maxDailyDrawdown = Number(input.max_daily_drawdown);
     const maxLotSize = Number(input.max_lot_size);
-    const performanceFeeRate = input.performance_fee_rate === undefined ? 0.1 : Number(input.performance_fee_rate);
+    const performanceFeeRate = input.performance_fee_rate === undefined ? 0.2 : Number(input.performance_fee_rate);
     if (botName.length < 1 || botName.length > 64) throw badRequest('bot_name must contain 1-64 characters');
     if (!isUuid(input.mt5_account_id)) throw badRequest('mt5_account_id must be a UUID');
     if (!Number.isFinite(maxDailyDrawdown) || maxDailyDrawdown <= 0) throw badRequest('max_daily_drawdown must be greater than 0 USD');

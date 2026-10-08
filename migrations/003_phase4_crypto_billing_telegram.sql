@@ -2,7 +2,7 @@
 ALTER TABLE users ADD COLUMN low_wallet_alerted_at TIMESTAMPTZ;
 ALTER TABLE subscriptions
   ADD COLUMN monthly_price_usd NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (monthly_price_usd >= 0);
-ALTER TABLE bots_config ALTER COLUMN performance_fee_rate SET DEFAULT 0.1000;
+ALTER TABLE bots_config ALTER COLUMN performance_fee_rate SET DEFAULT 0.2000;
 
 CREATE TABLE wallet_transactions (
   id UUID PRIMARY KEY,

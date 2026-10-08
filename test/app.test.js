@@ -9,7 +9,6 @@ import { Mt5AccountService } from '../src/services/mt5-account-service.js';
 import { generateSessionToken, hashApiKey, hashSessionToken } from '../src/security/secrets.js';
 import { decryptMt5InvestorPassword } from '../src/security/encryption.js';
 import { createTestPool } from '../test-support/pglite-pool.js';
-import { signNowPaymentsPayload } from '../src/services/payment-service.js';
 
 const apiKeyPepper = 'test-api-key-pepper-0123456789abcdef-xyz';
 const sessionPepper = 'test-session-pepper-0123456789abcdef-xyz';
@@ -47,30 +46,21 @@ after(async () => {
   await pool?.end();
 });
 
-async function startHarness({ config: testConfig = config, paymentProvider, telegramClient } = {}) {
+beforeEach(async () => {
   const logs = [];
   const logger = {
     info: (event, fields) => logs.push({ level: 'info', event, fields }),
     warn: (event, fields) => logs.push({ level: 'warn', event, fields }),
     error: (event, fields) => logs.push({ level: 'error', event, fields }),
   };
-  const app = createApp({ config: testConfig, repository, logger, paymentProvider, telegramClient });
+  const app = createApp({ config, repository, logger });
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve, reject) => {
     server.once('listening', resolve);
     server.once('error', reject);
   });
-  return { baseUrl: `http://127.0.0.1:${server.address().port}`, server, logs, app, config: testConfig };
-}
-
-beforeEach(async () => {
-  harness = await startHarness();
+  harness = { baseUrl: `http://127.0.0.1:${server.address().port}`, server, logs };
 });
-
-async function replaceHarness(options) {
-  await new Promise((resolve, reject) => harness.server.close((error) => error ? reject(error) : resolve()));
-  harness = await startHarness(options);
-}
 
 afterEach(async () => {
   if (!harness) return;
