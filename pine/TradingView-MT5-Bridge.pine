@@ -1,0 +1,43 @@
+//@version=5
+strategy("TradingView → MT5 Demo Bridge (example)", overlay=true, pyramiding=0, process_orders_on_close=true)
+
+// This is a user API key created in POST /api/v1/api-keys, not the MT5 bridge key.
+// Keep the key private; never publish this script or share an alert containing it.
+apiKey        = input.string("PASTE_USER_API_KEY_HERE", "User API key", confirm=true)
+botId         = input.string("", "Bot UUID (optional if API key is scoped to a bot)", confirm=true)
+lotSize       = input.float(0.10, "MT5 lot size", minval=0.01, step=0.01)
+stopLossPips  = input.float(30.0, "Stop loss (pips; 0 disables)", minval=0.0, step=0.1)
+takeProfitPips = input.float(60.0, "Take profit (pips; 0 disables)", minval=0.0, step=0.1)
+fastLength    = input.int(9, "Fast SMA", minval=1)
+slowLength    = input.int(21, "Slow SMA", minval=2)
+
+fast = ta.sma(close, fastLength)
+slow = ta.sma(close, slowLength)
+plot(fast, "Fast SMA", color=color.teal)
+plot(slow, "Slow SMA", color=color.orange)
+
+// Stops are sent as distances in pips. The EA calculates absolute levels from the current MT5 quote.
+f_send(string action, float slPips, float tpPips) =>
+    string signalId = str.tostring(timenow) + "_" + str.tostring(bar_index) + "_" + action
+    string slValue = na(slPips) or slPips <= 0 ? "null" : str.tostring(slPips)
+    string tpValue = na(tpPips) or tpPips <= 0 ? "null" : str.tostring(tpPips)
+    string botField = str.length(botId) > 0 ? ',"bot_id":"' + botId + '"' : ""
+    string payload = '{"secret_key":"' + apiKey + '","signal_id":"' + signalId + '","action":"' + action + '","symbol":"' + syminfo.ticker + '","lot":' + str.tostring(lotSize) + ',"stop_loss":' + slValue + ',"take_profit":' + tpValue + ',"stop_loss_type":"pips","take_profit_type":"pips"' + botField + '}'
+    alert(payload, alert.freq_all)
+
+longSignal = ta.crossover(fast, slow)
+shortSignal = ta.crossunder(fast, slow)
+
+if longSignal and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close_all(comment="reverse to long")
+        f_send("CLOSE", na, na)
+    strategy.entry("Long", strategy.long, qty=lotSize)
+    f_send("BUY", stopLossPips, takeProfitPips)
+
+if shortSignal and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close_all(comment="reverse to short")
+        f_send("CLOSE", na, na)
+    strategy.entry("Short", strategy.short, qty=lotSize)
+    f_send("SELL", stopLossPips, takeProfitPips)
