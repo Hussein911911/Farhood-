@@ -1427,7 +1427,7 @@ class PostgresTransaction {
       if (!userResult.rows[0]) throw new Error('Trade user disappeared before trade log insert');
       const balance = Number(userResult.rows[0].wallet_balance);
       const profitLoss = Number(result.profit_loss || 0);
-      const currency = result.profit_loss_currency || 'USD';
+      const currency = result.profit_loss_currency || 'UNK';
       if (command.action === 'CLOSE' && currency === 'USD' && profitLoss > 0) {
         feeDeducted = Math.min(balance, Math.round(profitLoss * Number(command.performance_fee_rate) * 100) / 100);
       }

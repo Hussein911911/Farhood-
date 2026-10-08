@@ -119,7 +119,7 @@ A missing server integration returns `503`; out-of-range amounts or a network ot
 
 ### Performance fees and wallet minimum
 
-- Set `performance_fee_rate` per bot as a decimal fraction (for example, `0.10` means 10%). When MT5 confirms a filled `CLOSE` with positive USD profit, the server deducts `min(available wallet, profit × fee rate)` atomically with the trade log and writes a `PERFORMANCE_FEE` ledger row. No fee is taken on a loss, an opening trade, or non-USD P/L. Non-USD P/L is not converted; use USD-denominated demo accounts for fee verification.
+- Set `performance_fee_rate` per bot as a decimal fraction (for example, `0.10` means 10%). When MT5 confirms a filled `CLOSE` with positive, explicitly USD-denominated profit, the server deducts `min(available wallet, profit × fee rate)` atomically with the trade log and writes a `PERFORMANCE_FEE` ledger row. No fee is taken on a loss, an opening trade, non-USD P/L, or a result with missing currency (logged as `UNK`). Non-USD/missing P/L currencies are not converted or counted toward the USD drawdown guard; use USD-denominated demo accounts and the bundled EA for fee verification.
 - `MIN_WALLET_BALANCE_USD` defaults to `$5.00`. A wallet below the threshold pauses all of that user's bots, fails queued new-entry commands, and blocks new `BUY`/`SELL` entries. A low-balance Telegram alert is deduplicated until the balance returns to the threshold. Funding the wallet does **not** automatically resume bots; review risk and manually reactivate them.
 - Risk-reducing `CLOSE` commands are still allowed through the API/bridge when the wallet is low or a subscription is no longer active, provided the MT5 account itself is active. Do not interpret this exception as a guarantee that the broker will fill a close. The MT5 terminal must be online, its EA must acknowledge execution, and broker rejection/market conditions still apply. Panic behavior and its acknowledgement limits remain described in the Phase 3 guide.
 - The existing daily drawdown guard is based on broker-reported realized USD P/L since 00:00 UTC. It pauses a bot and blocks new entries at the limit; it is not an equity monitor and does not include floating losses. If a bot's news filter is enabled without a provider, new entries continue to fail closed.
@@ -153,12 +153,12 @@ Telegram routes:
 Automated tests use PGlite and a fake payment provider/Telegram client; they do not send real crypto, reach a live provider, or verify MT5 execution. Run:
 
 ```sh
-# Repository root
+# Repository root: JavaScript syntax checks plus Next.js TypeScript checks, then integration tests
+npm run check
 npm test
 
-# Next.js dashboard
+# Next.js production compilation
 cd web
-npm run typecheck
 npm run build
 ```
 

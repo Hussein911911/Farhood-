@@ -212,6 +212,25 @@ test('creates USDT TRC20 deposit invoices and credits the wallet once after a si
   assert.equal(billing.wallet_transactions[0].transaction_type, 'TOP_UP');
 });
 
+test('does not charge a USD performance fee when an MT5 fill omits its P/L currency', async () => {
+  const user = await fixture({ walletBalance: 100 });
+  const close = await request('/api/v1/webhook', jsonOptions(signal(user.apiKey.secret_key, 'CLOSE')));
+  assert.equal(close.status, 202);
+  const command = await (await nextCommand(user.account, user.account.bridge_key)).json();
+  const result = await sendResult(user.account, user.account.bridge_key, command, {
+    profit_loss: 50,
+    profit_loss_currency: undefined,
+  });
+  assert.equal(result.status, 200);
+  assert.equal((await result.json()).performance_fee_deducted, 0);
+  const trade = await pool.query('SELECT profit_loss_currency,performance_fee_deducted FROM trade_logs WHERE command_id=$1', [command.id]);
+  assert.equal(trade.rows[0].profit_loss_currency, 'UNK');
+  assert.equal(Number(trade.rows[0].performance_fee_deducted), 0);
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id=$1', [user.user.id])).rows[0].wallet_balance), 100);
+  const fees = await pool.query("SELECT COUNT(*)::int AS count FROM wallet_transactions WHERE user_id=$1 AND transaction_type='PERFORMANCE_FEE'", [user.user.id]);
+  assert.equal(fees.rows[0].count, 0);
+});
+
 test('charges subscription upgrades and renewals atomically, and marks insufficient renewal balance past due', async () => {
   const user = await fixture({ walletBalance: 100 });
   await pool.query("UPDATE users SET subscription_tier='BASIC', wallet_balance=100 WHERE id=$1", [user.user.id]);
@@ -337,6 +356,19 @@ test('links Telegram with a short-lived one-time code and dispatches outbox noti
   }
   assert.equal(delivered.length, 1);
   assert.match(delivered[0].text, /alerts are connected/i);
+
+  const closeResponse = await request('/api/v1/webhook', jsonOptions(signal(user.apiKey.secret_key, 'CLOSE')));
+  assert.equal(closeResponse.status, 202);
+  const closeCommand = await (await nextCommand(user.account, user.account.bridge_key)).json();
+  const closeResult = await sendResult(user.account, user.account.bridge_key, closeCommand, { profit_loss: 10 });
+  assert.equal(closeResult.status, 200);
+  for (let attempt = 0; attempt < 20 && delivered.length < 2; attempt++) {
+    await harness.app.locals.services.telegramWorker.runBatch();
+  }
+  assert.equal(delivered.length, 2);
+  assert.match(delivered[1].text, /Trade closed/i);
+  assert.match(delivered[1].text, /Performance fee: USD 1\.00/i);
+
   const billing = await (await request('/api/v1/billing/overview', { headers: user.sessionHeaders })).json();
   assert.equal(billing.telegram_linked, true);
 

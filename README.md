@@ -31,10 +31,12 @@ See [`docs/PHASE-4-SETUP.md`](docs/PHASE-4-SETUP.md) for provider secrets, migra
 Requires **Node.js 20.18+** and PostgreSQL 14+ (or Supabase PostgreSQL).
 
 ```sh
-npm install
+npm ci
+npm --prefix web ci
 cp .env.example .env
 # Configure DATABASE_URL and replace all demo secrets in .env.
 npm run db:migrate
+npm run check
 npm test
 npm start
 ```

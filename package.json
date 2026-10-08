@@ -13,6 +13,8 @@
     "db:migrate": "node scripts/migrate.js",
     "demo:provision": "node scripts/provision-demo-subscription.js",
     "telegram:set-webhook": "node scripts/set-telegram-webhook.js",
+    "check:js": "node scripts/check-js.js",
+    "check": "npm run check:js && npm --prefix web run typecheck",
     "test": "node --test"
   },
   "dependencies": {
