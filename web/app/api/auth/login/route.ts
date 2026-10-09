@@ -18,9 +18,15 @@ export async function POST(request: Request) {
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(body),
       cache: 'no-store',
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(70_000),
     });
-    const payload = await upstream.json().catch(() => ({}));
+    const payload = await upstream.json().catch(() => null);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return NextResponse.json({
+        error: 'backend_unavailable',
+        message: 'The API may be waking from sleep or is temporarily unavailable. Wait a minute and try again.',
+      }, { status: 502 });
+    }
     if (!upstream.ok) return NextResponse.json(payload, { status: upstream.status });
     if (typeof payload.access_token !== 'string' || typeof payload.expires_at !== 'string') {
       return NextResponse.json({ error: 'invalid_backend_response' }, { status: 502 });

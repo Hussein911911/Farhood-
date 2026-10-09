@@ -48,7 +48,7 @@ async function proxy(request: Request, context: RouteContext) {
       headers: requestHeaders,
       body,
       cache: 'no-store',
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(70_000),
     });
     if (upstream.status === 204) {
       const response = new NextResponse(null, { status: 204 });

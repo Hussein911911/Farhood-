@@ -41,7 +41,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }) {
           invalid_email: 'Enter a valid email address.',
           invalid_password: 'Password must contain 12 to 128 characters.',
           duplicate_resource: 'An account already exists for this email.',
-          backend_unavailable: 'The authentication API is not reachable. Check the backend connection.',
+          backend_unavailable: 'The API may be waking from sleep. Wait up to a minute, then try again.',
         };
         throw new Error(validation[payload.error] || payload.message || payload.error || 'Unable to continue. Please try again.');
       }
