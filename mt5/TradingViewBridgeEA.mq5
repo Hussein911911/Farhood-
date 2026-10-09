@@ -1,5 +1,5 @@
 #property strict
-#property version   "2.00"
+#property version   "2.10"
 #property description "Polls a tenant-scoped PostgreSQL bridge and executes demo-account market orders."
 
 input string InpBaseUrl            = "http://127.0.0.1:3000";
@@ -143,6 +143,18 @@ void OnTimer()
    g_polling = false;
   }
 
+string CurrentTradeMode()
+  {
+   ENUM_ACCOUNT_TRADE_MODE mode = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(mode == ACCOUNT_TRADE_MODE_DEMO)
+      return "DEMO";
+   if(mode == ACCOUNT_TRADE_MODE_CONTEST)
+      return "CONTEST";
+   if(mode == ACCOUNT_TRADE_MODE_REAL)
+      return "REAL";
+   return "UNKNOWN";
+  }
+
 int HttpCall(const string method, const string path, const string body,
              char &response[], string &responseHeaders)
   {
@@ -158,6 +170,7 @@ int HttpCall(const string method, const string path, const string body,
 
    string headers = "Authorization: Bearer " + InpBridgeKey + "\r\n";
    headers += "X-Bridge-ID: " + InpBridgeId + "\r\n";
+   headers += "X-MT5-Trade-Mode: " + CurrentTradeMode() + "\r\n";
    if(method == "POST")
       headers += "Content-Type: application/json\r\n";
 

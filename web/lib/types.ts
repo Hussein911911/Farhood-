@@ -7,6 +7,8 @@ export type Mt5Account = {
   connection_status: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR' | string;
   is_active: boolean;
   last_seen_at: string | null;
+  reported_trade_mode: 'UNKNOWN' | 'DEMO' | 'CONTEST' | 'REAL' | string;
+  trade_mode_reported_at: string | null;
   created_at: string;
 };
 
@@ -82,6 +84,7 @@ export type DashboardOverview = {
     email: string;
     subscription_tier: string;
     wallet_balance: number;
+    demo_trial_credit_usd: number;
     created_at: string;
   };
   subscription: Subscription | null;

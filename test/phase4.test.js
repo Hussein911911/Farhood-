@@ -18,6 +18,7 @@ const baseConfig = {
   apiKeyPepper, sessionPepper, mt5EncryptionKey, minWalletBalanceUsd: 5, maxLot: 10,
   maxPendingSignals: 1000, bridgePollWaitMs: 100, bridgeLeaseMs: 10000, bridgeStaleMs: 30000,
   sessionTtlHours: 24, symbolMap: 'EURUSD:EURUSDm',
+  freeTrialDays: 15, freeTrialCreditUsd: 10, performanceFeesEnabled: true,
   subscriptionPricesUsd: { BASIC: 9.99, PLUS: 19.99, PRO: 49.99 },
 };
 
@@ -105,8 +106,12 @@ function signal(secret, action = 'BUY', overrides = {}) {
   };
 }
 
-function bridgeHeaders(account, bridgeKey) {
-  return { authorization: `Bearer ${bridgeKey}`, 'x-bridge-id': account.bridge_id };
+function bridgeHeaders(account, bridgeKey, tradeMode = 'DEMO') {
+  return {
+    authorization: `Bearer ${bridgeKey}`,
+    'x-bridge-id': account.bridge_id,
+    'x-mt5-trade-mode': tradeMode,
+  };
 }
 
 async function nextCommand(account, bridgeKey) {

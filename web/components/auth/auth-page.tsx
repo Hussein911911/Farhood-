@@ -101,7 +101,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }) {
             <div className="mb-4 flex size-11 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.035] text-emerald-200"><LockKeyhole size={19} /></div>
             <p className="eyebrow mb-2">{isRegister ? 'Create your workspace' : 'Welcome back'}</p>
             <h2 className="text-[28px] font-semibold tracking-[-.04em] text-white">{isRegister ? 'Start with a secure account' : 'Sign in to Farhood'}</h2>
-            <p className="mt-2 text-sm text-slate-500">{isRegister ? 'Register first, then connect your MT5 demo account.' : 'Your control room for every connection and strategy.'}</p>
+            <p className="mt-2 text-sm text-slate-500">{isRegister ? 'Start with a 15-day MT5 demo trial and a separate non-cash $10 allowance; your wallet stays untouched. Connect a demo terminal next.' : 'Your control room for every connection and strategy.'}</p>
           </div>
 
           {success && <div role="status" className="mb-5 flex gap-2 rounded-xl border border-emerald-300/15 bg-emerald-300/[0.06] p-3 text-xs leading-relaxed text-emerald-100"><Check size={15} className="mt-0.5 shrink-0" />{success}</div>}

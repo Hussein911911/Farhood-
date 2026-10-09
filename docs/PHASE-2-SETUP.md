@@ -104,7 +104,7 @@ Create a bot and attach it to that MT5 account:
 curl -i -X POST http://127.0.0.1:3000/api/v1/bots \
   -H 'Authorization: Bearer <access_token>' \
   -H 'Content-Type: application/json' \
-  -d '{"mt5_account_id":"<mt5_account_uuid>","bot_name":"EURUSD demo","max_daily_drawdown":250,"max_lot_size":0.10,"news_filter_enabled":false,"performance_fee_rate":0.20}'
+  -d '{"mt5_account_id":"<mt5_account_uuid>","bot_name":"EURUSD demo","max_daily_drawdown":250,"max_lot_size":0.10,"news_filter_enabled":false,"performance_fee_rate":0}'
 ```
 
 Create a TradingView key scoped to that bot. The full `secret_key` is returned **only once**:
@@ -120,7 +120,7 @@ The secret belongs in the private TradingView alert/script inputs. List and revo
 
 ## 4. Provision a local demo subscription and wallet
 
-A new user has no active subscription and a `$0` wallet by design. Production subscription state and wallet funding must come from a trusted billing/admin integration; this project does not let a user self-activate or mint wallet funds.
+A new user receives a free 15-day `BASIC` trial with a separate `$10` non-cash demo allowance; the real wallet stays `$0`. Trial access requires a fresh `DEMO` mode report from the bundled EA. Production wallet funding and paid-plan activation still come through the trusted billing/payment flow; this project does not let a user mint real wallet funds.
 
 For local development only, provision the registered user with an active demo plan and balance. Use the user UUID returned from registration:
 
@@ -145,7 +145,7 @@ This command is disabled when `NODE_ENV=production`. It updates the user's curre
    - Keep `InpServerWaitMs=20000`, `InpHttpTimeoutMs=30000`, and `InpStateSyncSeconds=15` initially.
 5. Confirm the terminal is connected, broker symbols are in Market Watch, and the **Experts** tab reports successful polling and position snapshots.
 
-The account-specific bridge key is different from the user's TradingView API key. Do not put `bridge_key` in Pine Script. A normal `CLOSE` command only closes positions for that MT5 symbol and the EA's `InpMagic` value. The Phase 3 dashboard uses `/api/v1/mt5/positions/sync` snapshots for EA-managed positions; these update approximately every 15 seconds and are not a broker-side streaming feed.
+The account-specific bridge key is different from the user's TradingView API key. Do not put `bridge_key` in Pine Script. The bundled EA reports `X-MT5-Trade-Mode` on each authenticated poll; trial entries require a fresh `DEMO` report. This is an EA/client report rather than an independent broker verification, so keep `InpAllowLiveAccount=false` and never use a live account for trial testing. A normal `CLOSE` command only closes positions for that MT5 symbol and the EA's `InpMagic` value. The Phase 3 dashboard uses `/api/v1/mt5/positions/sync` snapshots for EA-managed positions; these update approximately every 15 seconds and are not a broker-side streaming feed.
 
 ## 6. Send a direct webhook test
 
@@ -215,7 +215,7 @@ Migration `001_phase2_core.sql` creates the Phase 2 core tables; `002_phase3_das
 - A priority field for execution commands and the internal `PANIC` action
 - Nullable API-key linkage for trusted system-generated emergency commands
 
-Migration `003_phase4_crypto_billing_telegram.sql` adds wallet transactions/deposits, signed-payment event records, Telegram connect codes/links, and the notification outbox. See [`PHASE-4-SETUP.md`](PHASE-4-SETUP.md) for its full setup and operations guide.
+Migration `003_phase4_crypto_billing_telegram.sql` adds wallet transactions/deposits, signed-payment event records, Telegram connect codes/links, and the notification outbox. Migration `004_trial_access_and_demo_attestation.sql` adds the separate free-trial allowance, backfills eligible existing accounts with a 15-day trial, and records EA-reported terminal mode. See [`PHASE-4-SETUP.md`](PHASE-4-SETUP.md) for billing and trial operations.
 
 The core tables are `users`, `subscriptions`, `user_sessions`, `api_keys`, `mt5_accounts`, `bots_config`, `execution_commands` (persistent leased MT5 queue), and `trade_logs` (broker-confirmed fills).
 
@@ -225,7 +225,7 @@ The user `subscription_tier` is a materialized current tier; a qualifying `ACTIV
 
 The Phase 3 UI exposes an account-wide panic action: it disables every bot on the selected account, fails queued (unclaimed) commands, then inserts a high-priority internal `PANIC` command. The EA attempts to close positions matching its configured `InpMagic` across symbols and removes itself only after the close requests succeed and the API acknowledges the result. Claimed broker orders cannot be recalled; an offline EA leaves the panic queued, and broker rejection remains possible. Verify the terminal directly.
 
-The EA reports deal P/L in its MT5 account currency. For `CLOSE` fills denominated in USD, the server deducts `min(wallet_balance, max(profit_loss, 0) * performance_fee_rate)` in the same PostgreSQL transaction that records the trade. Opening fills are logged with zero realized P/L/fee. Non-USD P/L is logged with its currency but is not converted or charged; use USD demo accounts for fee verification.
+The EA reports deal P/L in its MT5 account currency. Performance-fee defaults are `0`, and the feature is disabled unless the server operator sets `PERFORMANCE_FEES_ENABLED=true`. If enabled and a nonzero `performance_fee_rate` is explicitly configured for paid access, the server deducts `min(wallet_balance, max(profit_loss, 0) * performance_fee_rate)` for eligible USD-denominated `CLOSE` fills in the same PostgreSQL transaction that records the trade. Closes queued during a trial or while a subscription is inactive are fee-exempt; opening fills are logged with zero realized P/L/fee. Non-USD P/L is logged with its currency but is not converted or charged; use USD demo accounts for fee verification.
 
 ## 9. Automated tests and troubleshooting
 

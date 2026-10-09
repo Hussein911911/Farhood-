@@ -60,10 +60,12 @@ async function verifyPassword(password, encoded) {
 }
 
 export class AuthService {
-  constructor({ repository, sessionPepper, sessionTtlHours = 24 }) {
+  constructor({ repository, sessionPepper, sessionTtlHours = 24, freeTrialDays = 15, freeTrialCreditUsd = 10 }) {
     this.repository = repository;
     this.sessionPepper = sessionPepper;
     this.sessionTtlMs = sessionTtlHours * 60 * 60 * 1000;
+    this.freeTrialDays = freeTrialDays;
+    this.freeTrialCreditUsd = freeTrialCreditUsd;
   }
 
   async register({ email, password }) {
@@ -72,7 +74,12 @@ export class AuthService {
       throw new AuthError('invalid_password', 'password must contain 12-128 characters');
     }
     const passwordHash = await hashPassword(password);
-    return this.repository.createUser({ email: normalizedEmail, passwordHash });
+    return this.repository.createUserWithTrial({
+      email: normalizedEmail,
+      passwordHash,
+      trialDays: this.freeTrialDays,
+      trialCreditUsd: this.freeTrialCreditUsd,
+    });
   }
 
   async login({ email, password }) {

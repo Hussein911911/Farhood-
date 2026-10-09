@@ -127,7 +127,7 @@ export function AccountsPage() {
       <PageHeading eyebrow="Connectivity" title="MT5 accounts" description="Register the demo login that your bridge EA is allowed to control. Account passwords are encrypted at rest and never returned by list endpoints." action={<Button onClick={() => setFormOpen(true)}><Plus size={15} /> Add account</Button>} />
       <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
         <InfoTile icon={Cable} title="Account-scoped bridge" description="Each account has an independent bridge ID and one-time key." />
-        <InfoTile icon={ShieldCheck} title="Demo-first guard" description="The EA checks its live terminal login and server before polling." />
+        <InfoTile icon={ShieldCheck} title="Demo-first guard" description="Trial entries require a fresh EA-reported DEMO mode; this is not independent broker verification." />
         <InfoTile icon={WalletCards} title="Secrets stay private" description="Investor credentials are encrypted and hidden after save." />
       </div>
 
@@ -141,7 +141,7 @@ export function AccountsPage() {
               <CardHeader className="pb-5">
                 <div className="flex min-w-0 items-center gap-3.5">
                   <div className={`flex size-12 shrink-0 items-center justify-center rounded-2xl border ${online ? 'border-emerald-300/15 bg-emerald-300/[0.07] text-emerald-200' : 'border-white/[0.07] bg-white/[0.03] text-slate-400'}`}><Server size={19} /></div>
-                  <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><CardTitle className="text-base">{account.broker_server}</CardTitle><Badge tone={online ? 'green' : account.is_active ? 'amber' : 'neutral'}><span className={`size-1.5 rounded-full ${online ? 'bg-emerald-300' : 'bg-current opacity-60'}`} />{online ? 'Online' : account.is_active ? 'Offline' : 'Paused'}</Badge></div><p className="mt-1.5 text-xs text-slate-500">Login <span className="font-mono text-slate-300">{account.account_number}</span> · last heartbeat {relativeTime(account.last_seen_at)}</p></div>
+                  <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><CardTitle className="text-base">{account.broker_server}</CardTitle><Badge tone={online ? 'green' : account.is_active ? 'amber' : 'neutral'}><span className={`size-1.5 rounded-full ${online ? 'bg-emerald-300' : 'bg-current opacity-60'}`} />{online ? 'Online' : account.is_active ? 'Offline' : 'Paused'}</Badge>{account.reported_trade_mode !== 'UNKNOWN' && <Badge tone={account.reported_trade_mode === 'DEMO' ? 'green' : 'amber'}>Last EA mode: {account.reported_trade_mode}</Badge>}</div><p className="mt-1.5 text-xs text-slate-500">Login <span className="font-mono text-slate-300">{account.account_number}</span> · last heartbeat {relativeTime(account.last_seen_at)}</p></div>
                 </div>
                 <span className="hidden text-right text-[10px] text-slate-600 sm:block">Added {formatDate(account.created_at)}</span>
               </CardHeader>

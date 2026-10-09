@@ -24,6 +24,15 @@ function positiveNumberFromEnv(env, name, fallback, { min = 0, max = Number.MAX_
   return value;
 }
 
+function booleanFromEnv(env, name, fallback = false) {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = String(raw).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(value)) return true;
+  if (['false', '0', 'no', 'off'].includes(value)) return false;
+  throw new Error(`${name} must be true or false`);
+}
+
 function subscriptionPricesFromEnv(raw) {
   if (!raw) return DEFAULT_SUBSCRIPTION_PRICES;
   let parsed;
@@ -106,6 +115,12 @@ export function loadConfig(env = process.env) {
   }
 
   const minWalletBalanceUsd = positiveNumberFromEnv(env, 'MIN_WALLET_BALANCE_USD', 5, { min: 0.01, max: 1000000 });
+  const freeTrialDays = integerFromEnv(env, 'FREE_TRIAL_DAYS', 15, { min: 1, max: 90 });
+  const freeTrialCreditUsd = positiveNumberFromEnv(env, 'FREE_TRIAL_CREDIT_USD', 10, { min: 0, max: 10000 });
+  const performanceFeesEnabled = booleanFromEnv(env, 'PERFORMANCE_FEES_ENABLED', false);
+  if (freeTrialCreditUsd < minWalletBalanceUsd) {
+    throw new Error('FREE_TRIAL_CREDIT_USD must be at least MIN_WALLET_BALANCE_USD');
+  }
   const maxLot = positiveNumberFromEnv(env, 'MAX_LOT', 100, { min: Number.EPSILON });
   const nowPaymentsApiKey = env.NOWPAYMENTS_API_KEY?.trim() || '';
   const nowPaymentsIpnSecret = env.NOWPAYMENTS_IPN_SECRET?.trim() || '';
@@ -126,6 +141,9 @@ export function loadConfig(env = process.env) {
     sessionPepper,
     mt5EncryptionKey,
     minWalletBalanceUsd,
+    freeTrialDays,
+    freeTrialCreditUsd,
+    performanceFeesEnabled,
     maxLot,
     maxPendingSignals: integerFromEnv(env, 'MAX_PENDING_SIGNALS', 10000, { min: 1, max: 1000000 }),
     bridgePollWaitMs: integerFromEnv(env, 'BRIDGE_POLL_WAIT_MS', 20000, { min: 0, max: 25000 }),

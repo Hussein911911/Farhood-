@@ -55,7 +55,7 @@ export function MarketplacePage() {
         max_daily_drawdown: selected.suggestedDrawdownUsd,
         max_lot_size: selected.suggestedLot,
         news_filter_enabled: false,
-        performance_fee_rate: selected.feeRate,
+        performance_fee_rate: 0,
       }) });
       setBots((current) => [result.bot, ...current]);
       setSelected(null);

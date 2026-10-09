@@ -22,7 +22,10 @@ export class WebhookService {
       if (!context.subscriptionActive && !isRiskReducingClose) {
         throw new ServiceError('subscription_inactive', 'An active subscription is required', 403);
       }
-      if (Number(context.walletBalance) < this.config.minWalletBalanceUsd) {
+      const cashBalanceCoversMinimum = Number(context.walletBalance) >= this.config.minWalletBalanceUsd;
+      const trialCreditCoversMinimum = context.trialActive
+        && Number(context.trialCreditUsd) >= this.config.minWalletBalanceUsd;
+      if (!cashBalanceCoversMinimum && !trialCreditCoversMinimum) {
         const low = await tx.enforceWalletMinimum(context.userId, this.config.minWalletBalanceUsd);
         if (low && !isRiskReducingClose) {
           return {
@@ -41,6 +44,25 @@ export class WebhookService {
       }
       if (!context.mt5Account?.is_active) {
         throw new ServiceError('mt5_account_inactive', 'The bot MT5 account is inactive', 403);
+      }
+      if (context.trialActive && !isRiskReducingClose) {
+        const reportedAt = context.mt5Account.tradeModeReportedAt
+          ? new Date(context.mt5Account.tradeModeReportedAt).getTime()
+          : Number.NaN;
+        const staleAfterMs = Number(this.config.bridgeStaleMs) > 0
+          ? Number(this.config.bridgeStaleMs) * 2
+          : 90000;
+        const freshDemoAttestation = context.mt5Account.tradeMode === 'DEMO'
+          && Number.isFinite(reportedAt)
+          && Date.now() - reportedAt >= -5000
+          && Date.now() - reportedAt <= staleAfterMs;
+        if (!freshDemoAttestation) {
+          throw new ServiceError(
+            'trial_demo_account_required',
+            'Free-trial entries require the official MT5 bridge to be online and reporting a demo account',
+            403,
+          );
+        }
       }
       if (context.bot.news_filter_enabled && !isRiskReducingClose) {
         throw new ServiceError('news_filter_unavailable', 'This bot requires a news-filter provider, which is not configured', 503);
@@ -71,9 +93,12 @@ export class WebhookService {
         }
       }
 
+      const executionContext = this.config.performanceFeesEnabled === true
+        ? context
+        : { ...context, bot: { ...context.bot, performance_fee_rate: 0 } };
       const queued = await tx.enqueueCommand({
         id: randomUUID(),
-        context,
+        context: executionContext,
         signal,
         maxPendingSignals: this.config.maxPendingSignals,
       });

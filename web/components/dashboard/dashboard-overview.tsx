@@ -132,7 +132,7 @@ export function DashboardOverview() {
       <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard loading={loading} label="Active PnL" icon={TrendingUp} value={activePnlUsd === null ? 'Multiple' : formatCurrency(activePnlUsd)} hint={positionSnapshotStale ? 'Position snapshot is stale · verify MT5 terminal' : activePnlEntries.length > 1 ? activePnlEntries.map(([currency, amount]) => `${currency} ${formatNumber(amount)}`).join(' · ') : 'MT5-managed open positions'} tone={activePnlUsd === null ? 'neutral' : activePnlUsd >= 0 ? 'green' : 'red'} />
         <MetricCard loading={loading} label="Trade records" icon={Activity} value={formatNumber(overview?.metrics.total_trades_executed ?? 0, 0)} hint={winRate === null ? 'Executed fills recorded' : `${winRate}% positive realized fills`} tone="neutral" />
-        <MetricCard loading={loading} label="Wallet credit" icon={Wallet} value={formatCurrency(overview?.user.wallet_balance ?? 0)} hint="USD · fees are deducted on eligible closes" tone="neutral" />
+        <MetricCard loading={loading} label="Wallet credit" icon={Wallet} value={formatCurrency(overview?.user.wallet_balance ?? 0)} hint="USD · optional performance fees apply only when configured and enabled" tone="neutral" />
         <MetricCard loading={loading} label="Subscription" icon={ShieldCheck} value={overview?.subscription?.tier || overview?.user.subscription_tier || '—'} hint={overview?.subscription ? `${overview.subscription.status.toLowerCase()} · renewals managed externally` : 'No active plan on file'} tone={overview?.subscription ? 'green' : 'amber'} />
       </div>
 

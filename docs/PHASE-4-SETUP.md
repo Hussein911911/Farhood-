@@ -1,6 +1,6 @@
 # Phase 4 — Crypto billing, wallet subscriptions, and Telegram alerts
 
-Phase 4 adds server-authoritative USDT deposits through NOWPayments, a PostgreSQL wallet ledger, monthly wallet-funded subscriptions, profitable-trade fees, low-wallet execution guards, and Telegram alerts. The dashboard billing page is **`/dashboard/billing`**. This guide supplements—not replaces—the Phase 1, 2, and 3 guides.
+Phase 4 adds server-authoritative USDT deposits through NOWPayments, a PostgreSQL wallet ledger, monthly wallet-funded subscriptions, configurable performance fees, low-wallet execution guards, and Telegram alerts. Phase 5 adds a free 15-day MT5 demo trial with a separate non-cash `$10` allowance. The dashboard billing page is **`/dashboard/billing`**. This guide supplements—not replaces—the Phase 1, 2, and 3 guides.
 
 > **Demo-first:** use a NOWPayments sandbox account and an MT5 demo account until the complete payment, webhook, wallet, renewal, and order-close paths have been reviewed. This software does not promise end-to-end execution latency below 100 ms or any trading outcome. Never test with funds you cannot afford to lose.
 
@@ -22,7 +22,7 @@ npm test
 npm start
 ```
 
-The migration runner applies numbered migrations under an advisory lock. Run migrations **before** starting the API; startup checks for Phase 2–4 tables and exits if the schema is incomplete. Back up production data before deployment. Migration `003_phase4_crypto_billing_telegram.sql` adds the wallet/deposit ledger, provider callback records, Telegram links/codes/updates, and notification outbox, and extends subscription and user state.
+The migration runner applies numbered migrations under an advisory lock. Run migrations **before** starting the API; startup checks for the required tables and trial fields and exits if the schema is incomplete. Back up production data before deployment. Migration `003_phase4_crypto_billing_telegram.sql` adds the wallet/deposit ledger, provider callback records, Telegram links/codes/updates, and notification outbox. Migration `004_trial_access_and_demo_attestation.sql` adds the isolated demo-trial allowance, grants eligible existing users with no subscription history a 15-day trial, records EA-reported terminal mode, and switches new performance-fee defaults to zero.
 
 The example binds the API to loopback. For a container or reverse-proxy deployment, set `HOST=0.0.0.0`, set `PORT` to the internal API port, and allow only intended HTTPS traffic at the edge. Run the backend and database on private networking.
 
@@ -43,6 +43,9 @@ openssl rand -hex 32   # TELEGRAM_WEBHOOK_SECRET
 | `MT5_ENCRYPTION_KEY` | Base64-encoded or hex-encoded 32-byte AES key. Back it up securely; encrypted MT5 investor passwords cannot be recovered without it. |
 | `HOST`, `PORT`, `DB_POOL_MAX` | API listener, port, and PostgreSQL pool sizing. |
 | `MIN_WALLET_BALANCE_USD` | Positive minimum for new entries; default is `$5.00`. |
+| `FREE_TRIAL_DAYS` | Trial duration in days; default is `15`, allowed range `1–90`. |
+| `FREE_TRIAL_CREDIT_USD` | Non-cash demo allowance; default is `$10.00` and must be at least `MIN_WALLET_BALANCE_USD`. It never enters the real wallet or broker account. |
+| `PERFORMANCE_FEES_ENABLED` | Feature switch for optional profit-share deductions; default `false`. Enable only if the operator has approved the applicable terms and completed legal/accounting review. |
 | `PAYMENT_MIN_USD`, `PAYMENT_MAX_USD` | Deposit bounds; defaults are `$5.00` and `$10,000.00`. |
 | `NOWPAYMENTS_API_KEY` | NOWPayments server API key. Required to create invoices. |
 | `NOWPAYMENTS_API_BASE_URL` | `https://api-sandbox.nowpayments.io/v1` for sandbox, or `https://api.nowpayments.io/v1` for production. Only those official HTTPS hosts and `/v1` are accepted. |
@@ -110,17 +113,25 @@ A missing server integration returns `503`; out-of-range amounts or a network ot
 
 ## 3. Wallet subscriptions, performance fees, and risk controls
 
+### Free demo trial
+
+- New sign-ups receive a `BASIC` `TRIAL` immediately for 15 days by default. The `$10` `demo_trial_credit_usd` is a non-cash platform allowance kept in its own database column; the real wallet remains unchanged, and this allowance cannot be withdrawn, used to pay a plan, or sent to MT5.
+- Migration `004` grants the same trial once to existing users who have no subscription history. Users with any prior subscription are not backfilled. Trial expiry never triggers a paid charge; users must choose a paid plan and fund their real wallet themselves.
+- During trial, new entries require a fresh `X-MT5-Trade-Mode: DEMO` report from the authenticated bundled EA. This prevents accidental trial entries from a terminal reporting `REAL` or `UNKNOWN`; it is still a client-reported value, not an independent broker-side account verification.
+- After expiry, new `BUY`/`SELL` entries are blocked, while risk-reducing `CLOSE`/`PANIC` commands remain available. Closes queued during a trial or while a subscription is inactive are exempt from performance fees.
+
 ### Monthly subscription billing
 
-- A plan upgrade is a full monthly charge from the current wallet balance (no prorating). It is applied transactionally with the subscription change and a `SUBSCRIPTION_CHARGE` ledger entry. A same-plan request returns `409`; insufficient funds return `402`.
+- A plan upgrade is a full monthly charge from the **real wallet** (no prorating). It is applied transactionally with the subscription change and a `SUBSCRIPTION_CHARGE` ledger entry. Users can explicitly activate a paid plan during trial, including the same `BASIC` tier; insufficient funds return `402`. After paying, keep at least `MIN_WALLET_BALANCE_USD` in the real wallet for new entries (trial allowance no longer counts).
+- A trial does not automatically convert to a paid plan when it expires. A paid active same-plan request returns `409`; insufficient funds return `402`.
 - The API process checks for due renewals every 60 seconds. A funded renewal deducts the configured tier price, writes a `SUBSCRIPTION_RENEWAL` ledger row, and advances the subscription by one month.
 - If funds are insufficient, the subscription becomes `PAST_DUE`, the user's bots are paused, queued `BUY`/`SELL` commands are failed, and a notification is queued. Add funds, then select/renew the plan from Billing. Renewal processing is server-side; do not implement billing timers in the browser.
 - Set `SUBSCRIPTION_PRICES_USD` before launch and communicate those terms clearly to users. Changing configured prices affects new upgrades and renewals; a subscription's saved monthly price is used for its renewal when present.
 
 ### Performance fees and wallet minimum
 
-- Set `performance_fee_rate` per bot as a decimal fraction (for example, `0.10` means 10%). When MT5 confirms a filled `CLOSE` with positive, explicitly USD-denominated profit, the server deducts `min(available wallet, profit × fee rate)` atomically with the trade log and writes a `PERFORMANCE_FEE` ledger row. No fee is taken on a loss, an opening trade, non-USD P/L, or a result with missing currency (logged as `UNK`). Non-USD/missing P/L currencies are not converted or counted toward the USD drawdown guard; use USD-denominated demo accounts and the bundled EA for fee verification.
-- `MIN_WALLET_BALANCE_USD` defaults to `$5.00`. A wallet below the threshold pauses all of that user's bots, fails queued new-entry commands, and blocks new `BUY`/`SELL` entries. A low-balance Telegram alert is deduplicated until the balance returns to the threshold. Funding the wallet does **not** automatically resume bots; review risk and manually reactivate them.
+- `performance_fee_rate` defaults to `0` and `PERFORMANCE_FEES_ENABLED` defaults to `false`. Only when the server-side flag is enabled and a nonzero rate is explicitly configured and disclosed, a paid active subscription's filled `CLOSE` with positive, explicitly USD-denominated profit incurs `min(available real wallet, profit × fee rate)`. The server deducts that fee atomically with the trade log and writes a `PERFORMANCE_FEE` ledger row. No fee is taken on closes queued during a trial or inactive subscription, losses, opening trades, non-USD P/L, or results with missing currency (logged as `UNK`). Non-USD/missing P/L currencies are not converted or counted toward the USD drawdown guard; use USD-denominated demo accounts and the bundled EA for fee verification.
+- `MIN_WALLET_BALANCE_USD` defaults to `$5.00`. A real wallet below the threshold pauses all of that user's bots, fails queued new-entry commands, and blocks new `BUY`/`SELL` entries. While an unexpired trial is active, the separate demo allowance can satisfy this execution guard only; it never changes the real wallet and expires with the trial. A low-balance Telegram alert is deduplicated until the required balance returns. Funding the wallet does **not** automatically resume bots; review risk and manually reactivate them.
 - Risk-reducing `CLOSE` commands are still allowed through the API/bridge when the wallet is low or a subscription is no longer active, provided the MT5 account itself is active. Do not interpret this exception as a guarantee that the broker will fill a close. The MT5 terminal must be online, its EA must acknowledge execution, and broker rejection/market conditions still apply. Panic behavior and its acknowledgement limits remain described in the Phase 3 guide.
 - The existing daily drawdown guard is based on broker-reported realized USD P/L since 00:00 UTC. It pauses a bot and blocks new entries at the limit; it is not an equity monitor and does not include floating losses. If a bot's news filter is enabled without a provider, new entries continue to fail closed.
 

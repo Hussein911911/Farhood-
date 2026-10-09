@@ -112,6 +112,8 @@ export function createApp({
     repository,
     sessionPepper: config.sessionPepper,
     sessionTtlHours: config.sessionTtlHours,
+    freeTrialDays: config.freeTrialDays ?? 15,
+    freeTrialCreditUsd: config.freeTrialCreditUsd ?? 10,
   });
   const apiKeyService = new ApiKeyService({ repository, apiKeyPepper: config.apiKeyPepper });
   const mt5AccountService = new Mt5AccountService({
@@ -119,7 +121,7 @@ export function createApp({
     apiKeyPepper: config.apiKeyPepper,
     mt5EncryptionKey: config.mt5EncryptionKey,
   });
-  const botService = new BotService({ repository });
+  const botService = new BotService({ repository, performanceFeesEnabled: config.performanceFeesEnabled === true });
   const webhookService = new WebhookService({ repository, apiKeyService, config });
   const billingService = new BillingService({ repository, config });
   const nowPayments = paymentProvider || new NowPaymentsClient({
@@ -160,7 +162,12 @@ export function createApp({
       res.status(401).json({ error: 'unauthorized' });
       return null;
     }
-    const account = await repository.authenticateBridge(bridgeId, hashBridgeKey(bridgeKey, config.apiKeyPepper));
+    const reportedTradeMode = req.get('x-mt5-trade-mode')?.trim().toUpperCase() || 'UNKNOWN';
+    const account = await repository.authenticateBridge(
+      bridgeId,
+      hashBridgeKey(bridgeKey, config.apiKeyPepper),
+      reportedTradeMode,
+    );
     if (!account) {
       res.status(401).json({ error: 'unauthorized' });
       return null;
@@ -295,7 +302,10 @@ export function createApp({
   }));
 
   app.get('/api/v1/bots', requireSession, asyncHandler(async (req, res) => {
-    return res.status(200).json({ bots: await botService.listForUser(req.user.id) });
+    return res.status(200).json({
+      bots: await botService.listForUser(req.user.id),
+      performance_fees_enabled: config.performanceFeesEnabled === true,
+    });
   }));
 
   app.patch('/api/v1/bots/:id', requireSession, asyncHandler(async (req, res) => {
@@ -353,6 +363,7 @@ export function createApp({
       payment_min_usd: config.paymentMinUsd ?? 5,
       payment_max_usd: config.paymentMaxUsd ?? 10000,
       min_wallet_balance_usd: config.minWalletBalanceUsd ?? 5,
+      free_trial_days: config.freeTrialDays ?? 15,
       telegram_enabled: telegramService.enabled,
       telegram_bot_username: config.telegramBotUsername || null,
     });
@@ -482,7 +493,13 @@ export function createApp({
 
     const deadline = Date.now() + waitMs;
     while (!req.destroyed) {
-      const command = await repository.claimNext(account.id, account.bridge_id, config.bridgeLeaseMs, config.minWalletBalanceUsd);
+      const command = await repository.claimNext(
+        account.id,
+        account.bridge_id,
+        config.bridgeLeaseMs,
+        config.minWalletBalanceUsd,
+        config.bridgeStaleMs,
+      );
       if (command) return res.status(200).json(command);
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
@@ -500,7 +517,14 @@ export function createApp({
       throw new PayloadValidationError('lease_token is required and must be a UUID');
     }
     const result = validateExecutionResult(req.body);
-    const completion = await repository.completeCommand(req.params.id, leaseToken, account.id, result, config.minWalletBalanceUsd);
+    const completion = await repository.completeCommand(
+      req.params.id,
+      leaseToken,
+      account.id,
+      result,
+      config.minWalletBalanceUsd,
+      config.performanceFeesEnabled === true,
+    );
     if (completion.kind === 'not_found') return res.status(404).json({ error: 'command_not_found' });
     if (completion.kind === 'stale') {
       return res.status(409).json({ error: 'stale_or_already_completed_command', status: completion.status });

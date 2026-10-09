@@ -20,6 +20,7 @@ export function BotsPage() {
   const [bots, setBots] = useState<TradingBot[]>([]);
   const [accounts, setAccounts] = useState<Mt5Account[]>([]);
   const [selectedId, setSelectedId] = useState('');
+  const [performanceFeesEnabled, setPerformanceFeesEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pendingBot, setPendingBot] = useState(false);
@@ -27,7 +28,7 @@ export function BotsPage() {
   const [panicOpen, setPanicOpen] = useState(false);
   const [panicPending, setPanicPending] = useState(false);
   const [error, setError] = useState('');
-  const [draft, setDraft] = useState({ max_daily_drawdown: 250, max_lot_size: 0.1, news_filter_enabled: false, performance_fee_rate: 0.2 });
+  const [draft, setDraft] = useState({ max_daily_drawdown: 250, max_lot_size: 0.1, news_filter_enabled: false, performance_fee_rate: 0 });
   const [newBotName, setNewBotName] = useState('');
   const [newAccountId, setNewAccountId] = useState('');
   const { toast } = useToast();
@@ -35,10 +36,11 @@ export function BotsPage() {
   const refresh = useCallback(async () => {
     try {
       const [botData, accountData] = await Promise.all([
-        apiFetch<{ bots: TradingBot[] }>('bots'),
+        apiFetch<{ bots: TradingBot[]; performance_fees_enabled?: boolean }>('bots'),
         apiFetch<{ mt5_accounts: Mt5Account[] }>('mt5-accounts'),
       ]);
       setBots(botData.bots);
+      setPerformanceFeesEnabled(Boolean(botData.performance_fees_enabled));
       setAccounts(accountData.mt5_accounts);
       setSelectedId((previous) => previous && botData.bots.some((bot) => bot.id === previous) ? previous : botData.bots[0]?.id || '');
       setError('');
@@ -64,7 +66,7 @@ export function BotsPage() {
         max_daily_drawdown: draft.max_daily_drawdown,
         max_lot_size: draft.max_lot_size,
         news_filter_enabled: draft.news_filter_enabled,
-        performance_fee_rate: draft.performance_fee_rate,
+        performance_fee_rate: performanceFeesEnabled ? draft.performance_fee_rate : 0,
       }) });
       setBots((current) => current.map((bot) => bot.id === result.bot.id ? result.bot : bot));
       toast({ kind: 'success', title: 'Risk profile updated', description: 'New webhook signals use these limits immediately.' });
@@ -92,7 +94,7 @@ export function BotsPage() {
         max_daily_drawdown: 250,
         max_lot_size: 0.1,
         news_filter_enabled: false,
-        performance_fee_rate: 0.2,
+        performance_fee_rate: 0,
       }) });
       setBots((current) => [response.bot, ...current]);
       setSelectedId(response.bot.id); setCreateOpen(false); setNewBotName('');
@@ -152,7 +154,7 @@ export function BotsPage() {
                   </div>
                   <div className="grid gap-3 md:grid-cols-2">
                     <div className="flex items-start justify-between gap-4 rounded-xl border border-white/[0.055] bg-white/[0.02] p-4"><div><p className="text-xs font-semibold text-slate-200">News filter</p><p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">Currently fails closed until a news-calendar provider is integrated.</p></div><Switch checked={draft.news_filter_enabled} onCheckedChange={(checked) => setDraft((current) => ({ ...current, news_filter_enabled: checked }))} aria-label="Enable news filter" /></div>
-                    <div><Label htmlFor="fee-rate">Performance fee rate</Label><div className="relative"><Input id="fee-rate" type="number" min="0" max="1" step="0.01" value={draft.performance_fee_rate} onChange={(event) => setDraft((current) => ({ ...current, performance_fee_rate: Number(event.target.value) }))} required /><span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs text-slate-600">0–1</span></div><p className="mt-1.5 text-[10px] text-slate-600">For example, 0.20 means 20% of positive realized USD on a close.</p></div>
+                    {performanceFeesEnabled ? <div><Label htmlFor="fee-rate">Optional performance fee</Label><div className="relative"><Input id="fee-rate" type="number" min="0" max="1" step="0.01" value={draft.performance_fee_rate} onChange={(event) => setDraft((current) => ({ ...current, performance_fee_rate: Number(event.target.value) }))} required /><span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs text-slate-600">0–1</span></div><p className="mt-1.5 text-[10px] text-slate-600">A non-zero rate is deducted only from positive realized USD on a paid-plan close.</p></div> : <div className="rounded-xl border border-white/[0.055] bg-white/[0.02] p-4"><p className="text-xs font-semibold text-slate-200">Performance-fee feature is disabled</p><p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">The server operator currently has this setting turned off. Fee rates cannot be configured while it is disabled.</p></div>}
                   </div>
                   <div className="flex flex-col gap-3 border-t border-white/[0.05] pt-5 sm:flex-row sm:items-center sm:justify-between"><p className="text-[10px] text-slate-600">Changes affect future signals. Existing claimed orders are not recalled.</p><Button type="submit" disabled={saving}><Save size={14} />{saving ? 'Saving…' : 'Save risk settings'}</Button></div>
                 </CardContent>

@@ -13,14 +13,14 @@ Phase 2 added PostgreSQL persistence and tenant-aware access controls to the Pha
 - AES-256-GCM encryption for optional read-only MT5 investor passwords.
 - Durable PostgreSQL execution queue with idempotency, row-locking/leases, per-user transaction boundaries, and account-keyed `LISTEN/NOTIFY` wakeups for cross-process long polls.
 - New-entry webhook authorization checks active subscription, wallet minimum, active bot/account, bot lot cap, daily drawdown, and news-filter availability before queueing; risk-reducing closes remain possible when subscription/wallet guards fail, provided the MT5 account is active.
-- Executed broker fills recorded in `trade_logs`; profitable USD close trades deduct a bot-configured performance fee atomically from the wallet.
+- Executed broker fills recorded in `trade_logs`; an optional, server-gated performance fee can be configured for eligible profitable USD close trades.
 - Authenticated APIs for sessions, keys, MT5 accounts, bot configuration, subscriptions, and trade-log retrieval.
 - Postgres-compatible integration tests run against PGlite (an embedded PostgreSQL WASM runtime), without requiring Docker or a local PostgreSQL service for `npm test`.
 
 ## Phase 4 billing and alerts
 
 - NOWPayments invoices for USDT on TRC20 and BEP20; signed callbacks credit a wallet only after provider status `FINISHED`, with per-event/per-deposit idempotency.
-- Monthly wallet-funded plan upgrades and renewals, auditable wallet transaction history, profitable USD close-trade performance fees, and a configurable low-wallet guard.
+- Monthly wallet-funded plan upgrades and renewals, auditable wallet transaction history, optional server-gated performance fees, and a configurable low-wallet guard.
 - Private-chat Telegram account linking with single-use connect codes and queued/retried trade, wallet, subscription, and risk alerts.
 - The Next.js `/dashboard/billing` page displays deposit address/QR, wallet ledger, subscriptions, and Telegram linking.
 
@@ -45,9 +45,9 @@ See **[Phase 2 database and end-to-end setup](docs/PHASE-2-SETUP.md)** for local
 
 ### Important billing and risk semantics
 
-- New registrations start with `BASIC`, a zero wallet, and **no active subscription**. Use the signed NOWPayments settlement flow and wallet-funded Billing actions to activate a plan; `scripts/provision-demo-subscription.js` remains local development tooling and refuses `NODE_ENV=production`.
-- “Sufficient” means `wallet_balance >= MIN_WALLET_BALANCE_USD` (default `$5.00`). Low wallet pauses bots, fails queued entries, and blocks new `BUY`/`SELL` commands; risk-reducing `CLOSE` commands remain available when the MT5 account is active. A credit does not automatically resume bots. The webhook also checks bot lot and realized UTC-day drawdown. If `news_filter_enabled=true`, new entries fail closed with `503` until a news provider is integrated.
-- Monthly subscription charges and profitable USD close-trade performance fees are recorded in the wallet ledger. MT5 reports P/L in the account's currency; fees and daily USD drawdown apply only to USD reports. Use USD-denominated demo accounts until an audited FX conversion service is added. Fees equal `max(profit_loss, 0) * performance_fee_rate`, capped at the available wallet balance so it cannot become negative.
+- New registrations receive a free 15-day `BASIC` `TRIAL` and a separate `$10` non-cash demo allowance. The real wallet stays at `$0`; the allowance cannot be withdrawn, transferred to a broker, or used for a paid plan. Eligible existing users with no subscription history are granted the same trial by migration `004`. A trial requires a fresh `DEMO` mode report from the authenticated official EA for new entries. It does not auto-convert to a paid plan. Use the signed NOWPayments settlement flow and Billing actions to start a paid plan; `scripts/provision-demo-subscription.js` remains local development tooling and refuses `NODE_ENV=production`.
+- “Sufficient” means `wallet_balance >= MIN_WALLET_BALANCE_USD` (default `$5.00`) for paid access, or an unexpired trial allowance at/above the same minimum while the trial is active. Trial allowance is never combined with real cash. Low real wallet pauses bots, fails queued entries, and blocks new `BUY`/`SELL` commands; risk-reducing `CLOSE` commands remain available when the MT5 account is active. A credit does not automatically resume bots. The webhook also checks bot lot and realized UTC-day drawdown. If `news_filter_enabled=true`, new entries fail closed with `503` until a news provider is integrated.
+- Monthly subscription charges are recorded in the real-wallet ledger. Performance fees default to `0` and are server-disabled by default; any explicitly configured nonzero rate is ignored unless `PERFORMANCE_FEES_ENABLED=true`, and then only applies to eligible positive USD close fills on paid access. Closes queued during a trial or while a subscription is inactive are fee-exempt. MT5 reports P/L in the account's currency; fees and daily USD drawdown apply only to USD reports. Use USD-denominated demo accounts until an audited FX conversion service is added.
 - Sessions, API-key hashes, bridge-key hashes, and database credentials are never returned by list endpoints. Newly issued API and bridge secrets are returned once. Do not put them in source control or public TradingView scripts.
 - Preserve and back up `MT5_ENCRYPTION_KEY`; losing it makes encrypted investor passwords unrecoverable. Key rotation requires decrypt/re-encrypt migration. The service only stores investor (read-only) passwords; it does not need the MT5 master trading password because the terminal is logged in locally.
 
@@ -55,7 +55,7 @@ See **[Phase 2 database and end-to-end setup](docs/PHASE-2-SETUP.md)** for local
 
 | Method | Route | Access | Purpose |
 |---|---|---|---|
-| `POST` | `/api/v1/auth/register` | Public | Create a user (no subscription is granted) |
+| `POST` | `/api/v1/auth/register` | Public | Create a user and grant a free 15-day `BASIC` demo trial |
 | `POST` | `/api/v1/auth/login` | Public | Create a session bearer token |
 | `POST` | `/api/v1/auth/logout` | Session | Revoke current session |
 | `POST`, `GET`, `DELETE` | `/api/v1/api-keys` | Session | Issue/list/revoke user API keys; secret shown once |

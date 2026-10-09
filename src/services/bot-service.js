@@ -1,15 +1,19 @@
 import { randomUUID } from 'node:crypto';
 
 export class BotService {
-  constructor({ repository }) {
+  constructor({ repository, performanceFeesEnabled = false }) {
     this.repository = repository;
+    this.performanceFeesEnabled = performanceFeesEnabled;
   }
 
   async createForUser(userId, input) {
     const botName = typeof input.bot_name === 'string' ? input.bot_name.trim() : '';
     const maxDailyDrawdown = Number(input.max_daily_drawdown);
     const maxLotSize = Number(input.max_lot_size);
-    const performanceFeeRate = input.performance_fee_rate === undefined ? 0.2 : Number(input.performance_fee_rate);
+    const performanceFeeRate = input.performance_fee_rate === undefined ? 0 : Number(input.performance_fee_rate);
+    if (!this.performanceFeesEnabled && performanceFeeRate > 0) {
+      throw badRequest('performance fees are disabled by the service operator');
+    }
     if (botName.length < 1 || botName.length > 64) throw badRequest('bot_name must contain 1-64 characters');
     if (!isUuid(input.mt5_account_id)) throw badRequest('mt5_account_id must be a UUID');
     if (!Number.isFinite(maxDailyDrawdown) || maxDailyDrawdown <= 0) throw badRequest('max_daily_drawdown must be greater than 0 USD');
@@ -57,6 +61,9 @@ export class BotService {
       patch.performanceFeeRate = Number(input.performance_fee_rate);
       if (!Number.isFinite(patch.performanceFeeRate) || patch.performanceFeeRate < 0 || patch.performanceFeeRate > 1) {
         throw badRequest('performance_fee_rate must be between 0 and 1');
+      }
+      if (!this.performanceFeesEnabled && patch.performanceFeeRate > 0) {
+        throw badRequest('performance fees are disabled by the service operator');
       }
     }
     if (input.is_active !== undefined) {

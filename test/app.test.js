@@ -23,6 +23,9 @@ const config = {
   sessionPepper,
   mt5EncryptionKey,
   minWalletBalanceUsd: 0.01,
+  freeTrialDays: 15,
+  freeTrialCreditUsd: 10,
+  performanceFeesEnabled: true,
   maxLot: 10,
   maxPendingSignals: 1000,
   bridgePollWaitMs: 100,
@@ -59,7 +62,7 @@ beforeEach(async () => {
     server.once('listening', resolve);
     server.once('error', reject);
   });
-  harness = { baseUrl: `http://127.0.0.1:${server.address().port}`, server, logs };
+  harness = { baseUrl: `http://127.0.0.1:${server.address().port}`, server, logs, app };
 });
 
 afterEach(async () => {
@@ -81,6 +84,7 @@ function jsonOptions(body, headers = {}) {
 }
 
 async function setSubscription(userId, { tier = 'PRO', status = 'ACTIVE', walletBalance = 100 } = {}) {
+  await pool.query("UPDATE subscriptions SET status = 'CANCELED' WHERE user_id = $1 AND status IN ('TRIAL', 'ACTIVE')", [userId]);
   await pool.query('UPDATE users SET subscription_tier = $2, wallet_balance = $3 WHERE id = $1', [userId, tier, walletBalance]);
   await pool.query(
     `INSERT INTO subscriptions (id, user_id, tier, status, starts_at)
@@ -142,16 +146,17 @@ function webhookPayload(secretKey, overrides = {}) {
   };
 }
 
-function bridgeHeaders(account, bridgeKey) {
+function bridgeHeaders(account, bridgeKey, tradeMode = 'DEMO') {
   return {
     authorization: `Bearer ${bridgeKey}`,
     'x-bridge-id': account.bridge_id,
+    'x-mt5-trade-mode': tradeMode,
   };
 }
 
-async function nextCommand(account, bridgeKey) {
+async function nextCommand(account, bridgeKey, tradeMode = 'DEMO') {
   return request('/api/v1/mt5/commands/next?wait_ms=0', {
-    headers: bridgeHeaders(account, bridgeKey),
+    headers: bridgeHeaders(account, bridgeKey, tradeMode),
   });
 }
 
@@ -179,6 +184,23 @@ test('registers sessions, encrypts MT5 data, hashes user API keys, then logs tra
   const registeredUser = (await register.json()).user;
   assert.equal(registeredUser.email, email.toLowerCase());
   assert.equal(registeredUser.wallet_balance, 0);
+  const trialUserRow = await pool.query(
+    'SELECT subscription_tier, wallet_balance, demo_trial_credit_usd FROM users WHERE id = $1',
+    [registeredUser.id],
+  );
+  assert.equal(trialUserRow.rows[0].subscription_tier, 'BASIC');
+  assert.equal(Number(trialUserRow.rows[0].wallet_balance), 0);
+  assert.equal(Number(trialUserRow.rows[0].demo_trial_credit_usd), 10);
+  const initialTrial = await pool.query(
+    'SELECT tier, status, provider, monthly_price_usd, starts_at, ends_at FROM subscriptions WHERE user_id = $1',
+    [registeredUser.id],
+  );
+  assert.equal(initialTrial.rows.length, 1);
+  assert.equal(initialTrial.rows[0].tier, 'BASIC');
+  assert.equal(initialTrial.rows[0].status, 'TRIAL');
+  assert.equal(initialTrial.rows[0].provider, 'free_trial');
+  assert.equal(Number(initialTrial.rows[0].monthly_price_usd), 0);
+  assert.ok(new Date(initialTrial.rows[0].ends_at).getTime() - Date.now() > 14 * 24 * 60 * 60 * 1000);
 
   const login = await request('/api/v1/auth/login', jsonOptions({ email, password }));
   assert.equal(login.status, 200);
@@ -425,4 +447,234 @@ test('panic switch pauses all account bots, prioritizes a close command, and rec
   assert.equal((await ack.json()).trade_logged, false);
   const logCount = await pool.query('SELECT COUNT(*)::int AS count FROM trade_logs WHERE user_id = $1', [fixture.user.id]);
   assert.equal(logCount.rows[0].count, 0);
+});
+
+test('runs the free demo trial without cash-wallet mixing, requires a fresh demo-mode report, and keeps closes available after expiry', async () => {
+  const email = `trial-${randomUUID()}@example.test`;
+  const password = 'Demo-Trial-Safe-Password-42!';
+  const register = await request('/api/v1/auth/register', jsonOptions({ email, password }));
+  assert.equal(register.status, 201);
+  const registeredUser = (await register.json()).user;
+  const login = await request('/api/v1/auth/login', jsonOptions({ email, password }));
+  assert.equal(login.status, 200);
+  const session = await login.json();
+  const sessionHeaders = { authorization: `Bearer ${session.access_token}` };
+  const trialBillingResponse = await request('/api/v1/billing/overview', { headers: sessionHeaders });
+  assert.equal(trialBillingResponse.status, 200);
+  const trialBilling = await trialBillingResponse.json();
+  assert.equal(trialBilling.trial_active, true);
+  assert.equal(trialBilling.demo_trial_credit_usd, 10);
+  assert.equal(trialBilling.free_trial_days, 15);
+  assert.equal(trialBilling.wallet_balance, 0);
+
+  const accountResponse = await request('/api/v1/mt5-accounts', jsonOptions({
+    account_number: '777001234',
+    broker_server: 'Demo-Broker-Trial',
+  }, sessionHeaders));
+  assert.equal(accountResponse.status, 201);
+  const account = await accountResponse.json();
+  const botResponse = await request('/api/v1/bots', jsonOptions({
+    mt5_account_id: account.id,
+    bot_name: 'Trial demo bot',
+    max_daily_drawdown: 100,
+    max_lot_size: 0.1,
+    performance_fee_rate: 0.5,
+  }, sessionHeaders));
+  assert.equal(botResponse.status, 201);
+  const bot = (await botResponse.json()).bot;
+  const keyResponse = await request('/api/v1/api-keys', jsonOptions({ bot_id: bot.id }, sessionHeaders));
+  assert.equal(keyResponse.status, 201);
+  const apiKey = await keyResponse.json();
+
+  const beforeDemoHeartbeat = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-requires-demo-report',
+  })));
+  assert.equal(beforeDemoHeartbeat.status, 403);
+  assert.equal((await beforeDemoHeartbeat.json()).error, 'trial_demo_account_required');
+  const liveModeHeartbeat = await nextCommand(account, account.bridge_key, 'REAL');
+  assert.equal(liveModeHeartbeat.status, 204);
+  const liveModeOpen = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-live-account-blocked',
+  })));
+  assert.equal(liveModeOpen.status, 403);
+  assert.equal((await liveModeOpen.json()).error, 'trial_demo_account_required');
+
+  const demoHeartbeat = await nextCommand(account, account.bridge_key, 'DEMO');
+  assert.equal(demoHeartbeat.status, 204);
+  const accepted = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-demo-buy',
+  })));
+  assert.equal(accepted.status, 202);
+  const buyPoll = await nextCommand(account, account.bridge_key, 'DEMO');
+  assert.equal(buyPoll.status, 200);
+  const buyCommand = await buyPoll.json();
+  const buyFlags = await pool.query('SELECT performance_fee_exempt FROM execution_commands WHERE id = $1', [buyCommand.id]);
+  assert.equal(buyFlags.rows[0].performance_fee_exempt, true);
+  assert.equal((await sendResult(account, account.bridge_key, buyCommand)).status, 200);
+
+  const walletBeforeClose = await pool.query('UPDATE users SET wallet_balance = 100 WHERE id = $1', [registeredUser.id]);
+  assert.equal(walletBeforeClose.rowCount, 1);
+  const closeAccepted = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-demo-close',
+    action: 'CLOSE',
+    lot: undefined,
+    stop_loss: null,
+    take_profit: null,
+  })));
+  assert.equal(closeAccepted.status, 202);
+  const closePoll = await nextCommand(account, account.bridge_key, 'DEMO');
+  assert.equal(closePoll.status, 200);
+  const closeCommand = await closePoll.json();
+  const closeAck = await sendResult(account, account.bridge_key, closeCommand, {
+    profit_loss: 25,
+    profit_loss_currency: 'USD',
+  });
+  assert.equal(closeAck.status, 200);
+  assert.equal((await closeAck.json()).performance_fee_deducted, 0);
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [registeredUser.id])).rows[0].wallet_balance), 100);
+  assert.equal(Number((await pool.query(
+    "SELECT COUNT(*)::int AS count FROM wallet_transactions WHERE user_id = $1 AND transaction_type = 'PERFORMANCE_FEE'",
+    [registeredUser.id],
+  )).rows[0].count), 0);
+
+  await pool.query("UPDATE subscriptions SET starts_at = now() - interval '16 days', ends_at = now() - interval '1 second' WHERE user_id = $1 AND status = 'TRIAL'", [registeredUser.id]);
+  const justExpiredBilling = await (await request('/api/v1/billing/overview', { headers: sessionHeaders })).json();
+  assert.equal(justExpiredBilling.trial_active, false);
+  assert.equal(justExpiredBilling.demo_trial_credit_usd, 0);
+  assert.equal(justExpiredBilling.subscription.status, 'EXPIRED');
+  const justExpiredHistory = await (await request('/api/v1/subscriptions', { headers: sessionHeaders })).json();
+  assert.equal(justExpiredHistory.subscriptions[0].status, 'EXPIRED');
+  const justExpiredDashboard = await (await request('/api/v1/dashboard/overview', { headers: sessionHeaders })).json();
+  assert.equal(justExpiredDashboard.subscription, null);
+  assert.equal(justExpiredDashboard.user.demo_trial_credit_usd, 0);
+  const expiryOutcomes = await harness.app.locals.services.billingService.renewDueSubscriptions();
+  assert.ok(expiryOutcomes.some((outcome) => outcome.kind === 'trial_expired'));
+  assert.equal((await pool.query('SELECT status FROM subscriptions WHERE user_id = $1', [registeredUser.id])).rows[0].status, 'EXPIRED');
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [registeredUser.id])).rows[0].wallet_balance), 100);
+
+  const expiredOpen = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-expired-buy',
+  })));
+  assert.equal(expiredOpen.status, 403);
+  assert.equal((await expiredOpen.json()).error, 'subscription_inactive');
+  const safeClose = await request('/api/v1/webhook', jsonOptions(webhookPayload(apiKey.secret_key, {
+    signal_id: 'trial-expired-close',
+    action: 'CLOSE',
+    lot: undefined,
+    stop_loss: null,
+    take_profit: null,
+  })));
+  assert.equal(safeClose.status, 202);
+  const safeClosePoll = await nextCommand(account, account.bridge_key, 'DEMO');
+  assert.equal(safeClosePoll.status, 200);
+  const expiredCloseCommand = await safeClosePoll.json();
+  assert.equal((await pool.query('SELECT performance_fee_exempt FROM execution_commands WHERE id = $1', [expiredCloseCommand.id])).rows[0].performance_fee_exempt, true);
+  const expiredCloseAck = await sendResult(account, account.bridge_key, expiredCloseCommand, {
+    profit_loss: 15,
+    profit_loss_currency: 'USD',
+  });
+  assert.equal(expiredCloseAck.status, 200);
+  assert.equal((await expiredCloseAck.json()).performance_fee_deducted, 0);
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [registeredUser.id])).rows[0].wallet_balance), 100);
+
+  const paidUpgrade = await request('/api/v1/subscriptions/upgrade', jsonOptions({ tier: 'BASIC' }, sessionHeaders));
+  assert.equal(paidUpgrade.status, 201);
+  const paidSubscription = (await paidUpgrade.json()).subscription;
+  assert.equal(paidSubscription.status, 'ACTIVE');
+  assert.equal(paidSubscription.tier, 'BASIC');
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [registeredUser.id])).rows[0].wallet_balance), 90.01);
+});
+
+test('paid subscription activation during trial requires real-wallet funds and never uses the demo allowance', async () => {
+  const email = `trial-upgrade-${randomUUID()}@example.test`;
+  const password = 'Paid-Plan-Opt-In-Password-42!';
+  const registration = await request('/api/v1/auth/register', jsonOptions({ email, password }));
+  assert.equal(registration.status, 201);
+  const { user } = await registration.json();
+  const login = await request('/api/v1/auth/login', jsonOptions({ email, password }));
+  const session = await login.json();
+  const headers = { authorization: `Bearer ${session.access_token}` };
+
+  const noCash = await request('/api/v1/subscriptions/upgrade', jsonOptions({ tier: 'BASIC' }, headers));
+  assert.equal(noCash.status, 402);
+  assert.equal((await noCash.json()).error, 'insufficient_wallet_balance');
+  assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id=$1', [user.id])).rows[0].wallet_balance), 0);
+
+  await pool.query('UPDATE users SET wallet_balance = 20 WHERE id = $1', [user.id]);
+  const paid = await request('/api/v1/subscriptions/upgrade', jsonOptions({ tier: 'BASIC' }, headers));
+  assert.equal(paid.status, 201);
+  const paidData = await paid.json();
+  assert.equal(paidData.subscription.status, 'ACTIVE');
+  assert.equal(paidData.subscription.tier, 'BASIC');
+  const subscriptions = await pool.query('SELECT status FROM subscriptions WHERE user_id=$1 ORDER BY created_at', [user.id]);
+  assert.equal(subscriptions.rows[0].status, 'CANCELED');
+  assert.equal(subscriptions.rows[1].status, 'ACTIVE');
+  const wallet = await pool.query('SELECT wallet_balance,demo_trial_credit_usd FROM users WHERE id=$1', [user.id]);
+  assert.equal(Number(wallet.rows[0].wallet_balance), 10.01);
+  assert.equal(Number(wallet.rows[0].demo_trial_credit_usd), 10);
+});
+
+test('server-side performance-fee switch is reported, rejects fee configuration, and prevents deductions when disabled', async () => {
+  const fixture = await provisionUser({ walletBalance: 100 });
+  const token = await createSessionForUser(fixture.user.id);
+  const sessionHeaders = { authorization: `Bearer ${token}` };
+  const disabledApp = createApp({
+    config: { ...config, performanceFeesEnabled: false },
+    repository,
+  });
+  const server = disabledApp.listen(0, '127.0.0.1');
+  await new Promise((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const disabledRequest = (path, options = {}) => fetch(`${baseUrl}${path}`, options);
+
+  try {
+    const settings = await (await disabledRequest('/api/v1/bots', { headers: sessionHeaders })).json();
+    assert.equal(settings.performance_fees_enabled, false);
+    const rejectedRate = await disabledRequest(`/api/v1/bots/${fixture.bot.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', ...sessionHeaders },
+      body: JSON.stringify({ performance_fee_rate: 0.25 }),
+    });
+    assert.equal(rejectedRate.status, 400);
+
+    const accepted = await disabledRequest('/api/v1/webhook', jsonOptions(webhookPayload(fixture.apiKey.secret_key, {
+      signal_id: 'fee-switch-off-close', action: 'CLOSE', lot: undefined, stop_loss: null, take_profit: null,
+    })));
+    assert.equal(accepted.status, 202);
+    const polled = await disabledRequest('/api/v1/mt5/commands/next?wait_ms=0', {
+      headers: bridgeHeaders(fixture.account, fixture.account.bridge_key),
+    });
+    assert.equal(polled.status, 200);
+    const command = await polled.json();
+    const commandSettings = await pool.query(
+      'SELECT performance_fee_rate,performance_fee_exempt FROM execution_commands WHERE id=$1',
+      [command.id],
+    );
+    assert.equal(Number(commandSettings.rows[0].performance_fee_rate), 0);
+    assert.equal(commandSettings.rows[0].performance_fee_exempt, false);
+
+    const completed = await disabledRequest(`/api/v1/mt5/commands/${command.id}/result`, jsonOptions({
+      lease_token: command.lease_token,
+      success: true,
+      retcode: 10009,
+      order: '987654321',
+      deal: '876543219',
+      price: 1.1,
+      executed_lot: 0.1,
+      profit_loss: 20,
+      profit_loss_currency: 'USD',
+    }, bridgeHeaders(fixture.account, fixture.account.bridge_key)));
+    assert.equal(completed.status, 200);
+    assert.equal((await completed.json()).performance_fee_deducted, 0);
+    assert.equal(Number((await pool.query('SELECT wallet_balance FROM users WHERE id=$1', [fixture.user.id])).rows[0].wallet_balance), 100);
+    assert.equal(Number((await pool.query(
+      "SELECT COUNT(*)::int AS count FROM wallet_transactions WHERE user_id=$1 AND transaction_type='PERFORMANCE_FEE'",
+      [fixture.user.id],
+    )).rows[0].count), 0);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });

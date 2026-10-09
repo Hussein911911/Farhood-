@@ -60,7 +60,13 @@ export async function assertSchemaReady(pool) {
            to_regclass('public.telegram_connect_codes') AS telegram_connect_codes,
            to_regclass('public.telegram_updates') AS telegram_updates,
            to_regclass('public.notification_outbox') AS notification_outbox,
-           to_regclass('public.schema_migrations') AS schema_migrations
+           to_regclass('public.schema_migrations') AS schema_migrations,
+           (SELECT COUNT(*) = 4 FROM information_schema.columns
+            WHERE table_schema = 'public' AND (
+              (table_name = 'users' AND column_name = 'demo_trial_credit_usd') OR
+              (table_name = 'mt5_accounts' AND column_name IN ('reported_trade_mode', 'trade_mode_reported_at')) OR
+              (table_name = 'execution_commands' AND column_name = 'performance_fee_exempt')
+            )) AS trial_access_ready
   `);
   const row = result.rows[0];
   const requiredTables = [
@@ -69,6 +75,7 @@ export async function assertSchemaReady(pool) {
     'notification_outbox', 'schema_migrations',
   ];
   const missingTables = requiredTables.filter((table) => !row?.[table]);
+  if (!row?.trial_access_ready) missingTables.push('trial_access_fields');
   if (missingTables.length > 0) {
     throw new Error(`Database schema is not initialized (missing: ${missingTables.join(', ')}). Run \`npm run db:migrate\` first.`);
   }

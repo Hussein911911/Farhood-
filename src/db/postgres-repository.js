@@ -19,6 +19,8 @@ function toPublicAccount(row) {
     connection_status: row.connection_status,
     is_active: row.is_active,
     last_seen_at: row.last_seen_at,
+    reported_trade_mode: row.reported_trade_mode || 'UNKNOWN',
+    trade_mode_reported_at: row.trade_mode_reported_at ?? null,
     created_at: row.created_at,
   };
 }
@@ -138,6 +140,10 @@ export class PostgresRepository {
     return result.rows[0];
   }
 
+  async createUserWithTrial(input) {
+    return this.transaction(async (tx) => tx.createUserWithTrial(input));
+  }
+
   async findUserByEmail(email) {
     const result = await this.pool.query(
       `SELECT id, email, password_hash, subscription_tier, wallet_balance, created_at
@@ -219,7 +225,8 @@ export class PostgresRepository {
       `INSERT INTO mt5_accounts
          (id, user_id, account_number, broker_server, investor_password_encrypted, bridge_id, bridge_key_hash)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, user_id, account_number, broker_server, bridge_id, connection_status, is_active, last_seen_at, created_at`,
+       RETURNING id, user_id, account_number, broker_server, bridge_id, connection_status, is_active,
+                 last_seen_at, reported_trade_mode, trade_mode_reported_at, created_at`,
       [id, userId, accountNumber, brokerServer, investorPasswordEncrypted, bridgeId, bridgeKeyHash],
     );
     return toPublicAccount(result.rows[0]);
@@ -228,7 +235,7 @@ export class PostgresRepository {
   async listMt5Accounts(userId) {
     const result = await this.pool.query(
       `SELECT id, user_id, account_number, broker_server, bridge_id, connection_status,
-              is_active, last_seen_at, created_at
+              is_active, last_seen_at, reported_trade_mode, trade_mode_reported_at, created_at
        FROM mt5_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
       [userId],
     );
@@ -285,7 +292,9 @@ export class PostgresRepository {
 
   async listSubscriptions(userId) {
     const result = await this.pool.query(
-      `SELECT id, user_id, tier, status, starts_at, ends_at, provider, created_at, updated_at
+      `SELECT id, user_id, tier,
+              CASE WHEN status = 'TRIAL' AND ends_at IS NOT NULL AND ends_at <= now() THEN 'EXPIRED' ELSE status END AS status,
+              starts_at, ends_at, provider, created_at, updated_at
        FROM subscriptions WHERE user_id = $1 ORDER BY starts_at DESC`,
       [userId],
     );
@@ -326,7 +335,7 @@ export class PostgresRepository {
   async getDashboardOverview(userId) {
     const [userResult, subscriptionResult, accounts, bots, positions, tradeTotals, realizedRows, recentTradeLogs] = await Promise.all([
       this.pool.query(
-        `SELECT id, email, subscription_tier, wallet_balance, created_at
+        `SELECT id, email, subscription_tier, wallet_balance, demo_trial_credit_usd, created_at
          FROM users WHERE id = $1`,
         [userId],
       ),
@@ -368,6 +377,9 @@ export class PostgresRepository {
         email: user.email,
         subscription_tier: user.subscription_tier,
         wallet_balance: Number(user.wallet_balance),
+        demo_trial_credit_usd: subscriptionResult.rows[0]?.status === 'TRIAL'
+          ? Number(user.demo_trial_credit_usd)
+          : 0,
         created_at: user.created_at,
       },
       subscription: subscriptionResult.rows[0] ?? null,
@@ -388,9 +400,12 @@ export class PostgresRepository {
 
   async getBillingOverview(userId) {
     const [userResult, subscriptionResult, depositsResult, walletTransactionsResult, telegramResult] = await Promise.all([
-      this.pool.query('SELECT wallet_balance, subscription_tier FROM users WHERE id = $1', [userId]),
+      this.pool.query('SELECT wallet_balance, subscription_tier, demo_trial_credit_usd FROM users WHERE id = $1', [userId]),
       this.pool.query(
-        `SELECT id, tier, status, starts_at, ends_at, provider, monthly_price_usd, created_at
+        `SELECT id, tier,
+                CASE WHEN status = 'TRIAL' AND ends_at IS NOT NULL AND ends_at <= now() THEN 'EXPIRED' ELSE status END AS status,
+                starts_at, ends_at, provider, monthly_price_usd, created_at,
+                (status = 'TRIAL' AND starts_at <= now() AND (ends_at IS NULL OR ends_at > now())) AS is_trial_active
          FROM subscriptions WHERE user_id = $1 ORDER BY starts_at DESC, created_at DESC LIMIT 1`,
         [userId],
       ),
@@ -413,12 +428,18 @@ export class PostgresRepository {
     ]);
     const user = userResult.rows[0];
     if (!user) return null;
+    const subscriptionRow = subscriptionResult.rows[0] ?? null;
+    const trialActive = Boolean(subscriptionRow?.is_trial_active);
+    const subscription = subscriptionRow ? { ...subscriptionRow } : null;
+    if (subscription) delete subscription.is_trial_active;
     return {
       wallet_balance: Number(user.wallet_balance),
       subscription_tier: user.subscription_tier,
-      subscription: subscriptionResult.rows[0] ? {
-        ...subscriptionResult.rows[0],
-        monthly_price_usd: Number(subscriptionResult.rows[0].monthly_price_usd),
+      trial_active: trialActive,
+      demo_trial_credit_usd: trialActive ? Number(user.demo_trial_credit_usd) : 0,
+      subscription: subscription ? {
+        ...subscription,
+        monthly_price_usd: Number(subscription.monthly_price_usd),
       } : null,
       deposits: depositsResult.rows.map(toPublicDeposit),
       wallet_transactions: walletTransactionsResult.rows.map(toPublicWalletTransaction),
@@ -536,29 +557,64 @@ export class PostgresRepository {
     );
   }
 
-  async authenticateBridge(bridgeId, bridgeKeyHash) {
+  async authenticateBridge(bridgeId, bridgeKeyHash, reportedTradeMode = 'UNKNOWN') {
+    const safeTradeMode = ['DEMO', 'CONTEST', 'REAL'].includes(reportedTradeMode) ? reportedTradeMode : 'UNKNOWN';
     const result = await this.pool.query(
       `UPDATE mt5_accounts
-       SET last_seen_at = now(), connection_status = 'CONNECTED', updated_at = now()
+       SET last_seen_at = now(), connection_status = 'CONNECTED',
+           reported_trade_mode = $3::varchar,
+           trade_mode_reported_at = CASE WHEN $3::varchar = 'UNKNOWN' THEN NULL ELSE now() END,
+           updated_at = now()
        WHERE bridge_id = $1 AND bridge_key_hash = $2 AND is_active = TRUE
-       RETURNING id, user_id, bridge_id`,
-      [bridgeId, bridgeKeyHash],
+       RETURNING id, user_id, bridge_id, reported_trade_mode, trade_mode_reported_at`,
+      [bridgeId, bridgeKeyHash, safeTradeMode],
     );
     return result.rows[0] ?? null;
   }
 
-  async claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd = 0) {
-    return this.transaction(async (tx) => tx.claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd));
+  async claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd = 0, bridgeStaleMs = 45000) {
+    return this.transaction(async (tx) => tx.claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd, bridgeStaleMs));
   }
 
-  async completeCommand(commandId, leaseToken, accountId, result, minWalletBalanceUsd = 0) {
-    return this.transaction(async (tx) => tx.completeCommand(commandId, leaseToken, accountId, result, minWalletBalanceUsd));
+  async completeCommand(commandId, leaseToken, accountId, result, minWalletBalanceUsd = 0, performanceFeesEnabled = false) {
+    return this.transaction(async (tx) => tx.completeCommand(
+      commandId,
+      leaseToken,
+      accountId,
+      result,
+      minWalletBalanceUsd,
+      performanceFeesEnabled,
+    ));
   }
 }
 
 class PostgresTransaction {
   constructor(client) {
     this.client = client;
+  }
+
+  async createUserWithTrial({ email, passwordHash, trialDays, trialCreditUsd }) {
+    if (!Number.isSafeInteger(trialDays) || trialDays < 1 || trialDays > 90) {
+      throw new Error('trialDays must be an integer between 1 and 90');
+    }
+    if (!Number.isFinite(Number(trialCreditUsd)) || Number(trialCreditUsd) < 0 || Number(trialCreditUsd) > 10000) {
+      throw new Error('trialCreditUsd must be between 0 and 10000');
+    }
+    const userId = randomUUID();
+    const userResult = await this.client.query(
+      `INSERT INTO users (id, email, password_hash, demo_trial_credit_usd)
+       VALUES ($1,$2,$3,$4)
+       RETURNING id, email, password_hash, subscription_tier, wallet_balance,
+                 demo_trial_credit_usd, created_at`,
+      [userId, email, passwordHash, Number(trialCreditUsd)],
+    );
+    await this.client.query(
+      `INSERT INTO subscriptions
+         (id, user_id, tier, status, starts_at, ends_at, provider, monthly_price_usd)
+       VALUES ($1,$2,'BASIC','TRIAL',now(),now() + ($3::int * interval '1 day'),'free_trial',0)`,
+      [randomUUID(), userId, trialDays],
+    );
+    return userResult.rows[0];
   }
 
   async enqueueNotification({ userId, eventType, payload = {}, idempotencyKey }) {
@@ -574,13 +630,21 @@ class PostgresTransaction {
   async enforceWalletMinimum(userId, minimumUsd) {
     if (!Number.isFinite(Number(minimumUsd)) || Number(minimumUsd) <= 0) return false;
     const userResult = await this.client.query(
-      `SELECT wallet_balance, low_wallet_alerted_at FROM users WHERE id = $1 FOR UPDATE`,
+      `SELECT u.wallet_balance, u.demo_trial_credit_usd, u.low_wallet_alerted_at,
+              EXISTS (
+                SELECT 1 FROM subscriptions s
+                WHERE s.user_id = u.id AND s.tier = u.subscription_tier AND s.status = 'TRIAL'
+                  AND s.starts_at <= now() AND (s.ends_at IS NULL OR s.ends_at > now())
+              ) AS trial_active
+       FROM users u WHERE u.id = $1 FOR UPDATE`,
       [userId],
     );
     const user = userResult.rows[0];
     if (!user) return false;
     const balance = Number(user.wallet_balance);
-    if (balance >= Number(minimumUsd)) {
+    const trialCreditCoversMinimum = Boolean(user.trial_active)
+      && Number(user.demo_trial_credit_usd) >= Number(minimumUsd);
+    if (balance >= Number(minimumUsd) || trialCreditCoversMinimum) {
       if (user.low_wallet_alerted_at) {
         await this.client.query('UPDATE users SET low_wallet_alerted_at = NULL WHERE id = $1', [userId]);
       }
@@ -753,7 +817,7 @@ class PostgresTransaction {
       [userId],
     );
     const current = currentResult.rows[0];
-    if (current?.tier === tier) return { kind: 'already_active' };
+    if (current?.tier === tier && current.status !== 'TRIAL') return { kind: 'already_active' };
     const balance = Number(user.wallet_balance);
     if (balance < monthlyPriceUsd) return { kind: 'insufficient_balance', balance, required: monthlyPriceUsd };
 
@@ -796,6 +860,30 @@ class PostgresTransaction {
   }
 
   async renewDueSubscriptions({ subscriptionPricesUsd, minWalletBalanceUsd }) {
+    const results = [];
+    const expiredTrials = await this.client.query(
+      `SELECT s.id, s.user_id, s.ends_at FROM subscriptions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.status = 'TRIAL' AND s.ends_at IS NOT NULL AND s.ends_at <= now()
+       ORDER BY s.ends_at, s.user_id
+       FOR UPDATE OF u, s SKIP LOCKED LIMIT 100`,
+    );
+    for (const trial of expiredTrials.rows) {
+      await this.client.query(
+        `UPDATE subscriptions SET status = 'EXPIRED', updated_at = now()
+         WHERE id = $1 AND status = 'TRIAL'`,
+        [trial.id],
+      );
+      await this.pauseUserForBilling(trial.user_id, 'Free trial ended; a paid subscription is required');
+      await this.enqueueNotification({
+        userId: trial.user_id,
+        eventType: 'TRIAL_EXPIRED',
+        payload: { ends_at: trial.ends_at },
+        idempotencyKey: `trial-expired:${trial.id}`,
+      });
+      results.push({ id: trial.id, kind: 'trial_expired' });
+    }
+
     const dueUsers = await this.client.query(
       `SELECT u.id FROM users u
        WHERE EXISTS (
@@ -807,7 +895,6 @@ class PostgresTransaction {
                  WHERE s.user_id = u.id AND s.status = 'ACTIVE' AND s.ends_at <= now()), u.id
        FOR UPDATE OF u SKIP LOCKED LIMIT 50`,
     );
-    const results = [];
     for (const { id: userId } of dueUsers.rows) {
       const due = await this.client.query(
         `SELECT id,user_id,tier,monthly_price_usd,ends_at FROM subscriptions
@@ -1118,10 +1205,10 @@ class PostgresTransaction {
     const result = await this.client.query(
       `UPDATE mt5_accounts
        SET bridge_id = $3, bridge_key_hash = $4, connection_status = 'DISCONNECTED',
-           last_seen_at = NULL, updated_at = now()
+           last_seen_at = NULL, reported_trade_mode = 'UNKNOWN', trade_mode_reported_at = NULL, updated_at = now()
        WHERE id = $1 AND user_id = $2
        RETURNING id, user_id, account_number, broker_server, bridge_id, connection_status,
-                 is_active, last_seen_at, created_at`,
+                 is_active, last_seen_at, reported_trade_mode, trade_mode_reported_at, created_at`,
       [accountId, userId, credential.bridgeId, credential.bridgeKeyHash],
     );
     return { kind: 'rotated', account: toPublicAccount(result.rows[0]) };
@@ -1138,10 +1225,11 @@ class PostgresTransaction {
     const result = await this.client.query(
       `UPDATE mt5_accounts
        SET is_active = TRUE, bridge_id = $3, bridge_key_hash = $4,
-           connection_status = 'DISCONNECTED', last_seen_at = NULL, updated_at = now()
+           connection_status = 'DISCONNECTED', last_seen_at = NULL,
+           reported_trade_mode = 'UNKNOWN', trade_mode_reported_at = NULL, updated_at = now()
        WHERE id = $1 AND user_id = $2
        RETURNING id, user_id, account_number, broker_server, bridge_id, connection_status,
-                 is_active, last_seen_at, created_at`,
+                 is_active, last_seen_at, reported_trade_mode, trade_mode_reported_at, created_at`,
       [accountId, userId, credential.bridgeId, credential.bridgeKeyHash],
     );
     return { kind: 'activated', account: toPublicAccount(result.rows[0]) };
@@ -1167,7 +1255,7 @@ class PostgresTransaction {
     await this.client.query('DELETE FROM mt5_positions WHERE mt5_account_id = $1', [accountId]);
     const result = await this.client.query(
       `UPDATE mt5_accounts SET is_active = FALSE, connection_status = 'DISCONNECTED',
-              last_seen_at = NULL, updated_at = now()
+              last_seen_at = NULL, reported_trade_mode = 'UNKNOWN', trade_mode_reported_at = NULL, updated_at = now()
        WHERE id = $1 AND user_id = $2
        RETURNING id`,
       [accountId, userId],
@@ -1178,7 +1266,8 @@ class PostgresTransaction {
   async getWebhookContext(secretHash, requestedBotId) {
     const keyResult = await this.client.query(
       `SELECT k.id AS api_key_id, k.user_id, k.bot_id AS api_key_bot_id,
-              u.subscription_tier AS user_subscription_tier, u.wallet_balance
+              u.subscription_tier AS user_subscription_tier, u.wallet_balance,
+              u.demo_trial_credit_usd
        FROM api_keys k JOIN users u ON u.id = k.user_id
        WHERE k.secret_key_hash = $1 AND k.is_active = TRUE
        FOR UPDATE OF k, u`,
@@ -1198,6 +1287,7 @@ class PostgresTransaction {
     const subscription = subscriptionResult.rows[0] ?? null;
     const subscriptionActive = Boolean(subscription)
       && subscription.tier === key.user_subscription_tier;
+    const trialActive = subscriptionActive && subscription?.status === 'TRIAL';
 
     if (key.api_key_bot_id && requestedBotId && key.api_key_bot_id !== requestedBotId) {
       return {
@@ -1205,7 +1295,10 @@ class PostgresTransaction {
         apiKeyBotId: key.api_key_bot_id,
         userId: key.user_id,
         walletBalance: key.wallet_balance,
+        trialCreditUsd: key.demo_trial_credit_usd,
+        trialActive,
         subscriptionActive,
+        subscription,
         bot: null,
         mt5Account: null,
       };
@@ -1216,7 +1309,8 @@ class PostgresTransaction {
       botResult = await this.client.query(
         `SELECT b.id, b.user_id, b.mt5_account_id, b.bot_name, b.max_daily_drawdown,
                 b.max_lot_size, b.news_filter_enabled, b.performance_fee_rate, b.is_active,
-                a.is_active AS account_is_active
+                a.is_active AS account_is_active, a.reported_trade_mode AS account_trade_mode,
+                a.trade_mode_reported_at, a.last_seen_at AS account_last_seen_at
          FROM bots_config b JOIN mt5_accounts a ON a.id = b.mt5_account_id AND a.user_id = b.user_id
          WHERE b.id = $1 AND b.user_id = $2
          FOR UPDATE OF b, a`,
@@ -1226,7 +1320,8 @@ class PostgresTransaction {
       botResult = await this.client.query(
         `SELECT b.id, b.user_id, b.mt5_account_id, b.bot_name, b.max_daily_drawdown,
                 b.max_lot_size, b.news_filter_enabled, b.performance_fee_rate, b.is_active,
-                a.is_active AS account_is_active
+                a.is_active AS account_is_active, a.reported_trade_mode AS account_trade_mode,
+                a.trade_mode_reported_at, a.last_seen_at AS account_last_seen_at
          FROM bots_config b JOIN mt5_accounts a ON a.id = b.mt5_account_id AND a.user_id = b.user_id
          WHERE b.user_id = $1
          ORDER BY b.is_active DESC, b.created_at LIMIT 2`,
@@ -1256,6 +1351,8 @@ class PostgresTransaction {
       userId: key.user_id,
       userSubscriptionTier: key.user_subscription_tier,
       walletBalance: key.wallet_balance,
+      trialCreditUsd: key.demo_trial_credit_usd,
+      trialActive,
       subscriptionActive,
       subscription,
       bot: botRow ? {
@@ -1268,7 +1365,13 @@ class PostgresTransaction {
         performance_fee_rate: botRow.performance_fee_rate,
         is_active: botRow.is_active,
       } : null,
-      mt5Account: botRow ? { id: botRow.mt5_account_id, is_active: botRow.account_is_active } : null,
+      mt5Account: botRow ? {
+        id: botRow.mt5_account_id,
+        is_active: botRow.account_is_active,
+        tradeMode: botRow.account_trade_mode || 'UNKNOWN',
+        tradeModeReportedAt: botRow.trade_mode_reported_at ?? null,
+        lastSeenAt: botRow.account_last_seen_at ?? null,
+      } : null,
       dailyNetPnl,
     };
   }
@@ -1308,13 +1411,14 @@ class PostgresTransaction {
       `INSERT INTO execution_commands
          (id, user_id, api_key_id, bot_id, mt5_account_id, idempotency_key, action,
           source_symbol, symbol, lot, stop_loss, take_profit, stop_loss_type,
-          take_profit_type, performance_fee_rate, payload)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
+          take_profit_type, performance_fee_rate, performance_fee_exempt, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb)
        RETURNING id, status, received_at`,
       [id, context.userId, context.apiKeyId, context.bot.id, context.mt5Account.id,
         signal.signalId, signal.action, signal.sourceSymbol, signal.symbol, signal.lot ?? 0,
         signal.stopLoss, signal.takeProfit, signal.stopLossType, signal.takeProfitType,
-        context.bot.performance_fee_rate, JSON.stringify(payload)],
+        context.bot.performance_fee_rate, context.trialActive || !context.subscriptionActive,
+        JSON.stringify(payload)],
     );
     await this.client.query("SELECT pg_notify('farhood_execution_commands', $1)", [context.mt5Account.id]);
     return {
@@ -1326,12 +1430,14 @@ class PostgresTransaction {
     };
   }
 
-  async claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd = 0) {
-    const account = await this.client.query(
-      `SELECT id, user_id FROM mt5_accounts WHERE id = $1 AND is_active = TRUE FOR UPDATE`,
+  async claimNext(accountId, bridgeId, leaseMs, minWalletBalanceUsd = 0, bridgeStaleMs = 45000) {
+    const accountResult = await this.client.query(
+      `SELECT id, user_id, reported_trade_mode, trade_mode_reported_at
+       FROM mt5_accounts WHERE id = $1 AND is_active = TRUE FOR UPDATE`,
       [accountId],
     );
-    if (!account.rows[0]) return null;
+    const account = accountResult.rows[0];
+    if (!account) return null;
     const now = new Date();
     await this.client.query(
       `UPDATE execution_commands
@@ -1339,7 +1445,41 @@ class PostgresTransaction {
        WHERE mt5_account_id = $1 AND status = 'CLAIMED' AND lease_until <= $2`,
       [accountId, now],
     );
-    const walletBelowMinimum = await this.enforceWalletMinimum(account.rows[0].user_id, minWalletBalanceUsd);
+
+    const subscriptionResult = await this.client.query(
+      `SELECT s.tier, s.status FROM subscriptions s
+       JOIN users u ON u.id = s.user_id AND u.subscription_tier = s.tier
+       WHERE s.user_id = $1 AND s.status IN ('ACTIVE', 'TRIAL')
+         AND s.starts_at <= now() AND (s.ends_at IS NULL OR s.ends_at > now())
+       ORDER BY s.starts_at DESC LIMIT 1 FOR SHARE OF s`,
+      [account.user_id],
+    );
+    const subscription = subscriptionResult.rows[0] ?? null;
+    const subscriptionActive = Boolean(subscription);
+    const trialActive = subscriptionActive && subscription.status === 'TRIAL';
+    const modeReportedAt = account.trade_mode_reported_at
+      ? new Date(account.trade_mode_reported_at).getTime()
+      : Number.NaN;
+    const modeReportAgeMs = Date.now() - modeReportedAt;
+    const freshDemoMode = account.reported_trade_mode === 'DEMO'
+      && Number.isFinite(modeReportedAt)
+      && modeReportAgeMs >= -5000
+      && modeReportAgeMs <= Math.max(10000, Number(bridgeStaleMs) * 2);
+
+    const walletBelowMinimum = await this.enforceWalletMinimum(account.user_id, minWalletBalanceUsd);
+    if (!subscriptionActive) {
+      await this.pauseUserForBilling(account.user_id, 'Free trial or paid subscription has ended');
+    }
+    const entrySignalsBlocked = !subscriptionActive || walletBelowMinimum || (trialActive && !freshDemoMode);
+    if (trialActive && !freshDemoMode) {
+      await this.client.query(
+        `UPDATE execution_commands
+         SET status = 'FAILED', result_json = $2::jsonb, claimed_by = NULL, lease_token = NULL,
+             lease_until = NULL, updated_at = now()
+         WHERE mt5_account_id = $1 AND status = 'QUEUED' AND action IN ('BUY', 'SELL')`,
+        [accountId, JSON.stringify({ success: false, message: 'Trial entries require a currently reported MT5 demo account' })],
+      );
+    }
     const result = await this.client.query(
       `SELECT id, idempotency_key, action, source_symbol, symbol, lot, stop_loss, take_profit,
               stop_loss_type, take_profit_type, received_at, attempt_count
@@ -1348,7 +1488,7 @@ class PostgresTransaction {
          AND ($2::boolean = FALSE OR action IN ('CLOSE', 'PANIC'))
        ORDER BY priority DESC, received_at, id
        LIMIT 1 FOR UPDATE SKIP LOCKED`,
-      [accountId, walletBelowMinimum],
+      [accountId, entrySignalsBlocked],
     );
     const row = result.rows[0];
     if (!row) return null;
@@ -1378,7 +1518,7 @@ class PostgresTransaction {
     };
   }
 
-  async completeCommand(commandId, leaseToken, accountId, result, minWalletBalanceUsd = 0) {
+  async completeCommand(commandId, leaseToken, accountId, result, minWalletBalanceUsd = 0, performanceFeesEnabled = false) {
     const ownerResult = await this.client.query(
       `SELECT user_id FROM execution_commands WHERE id = $1 AND mt5_account_id = $2`,
       [commandId, accountId],
@@ -1389,7 +1529,8 @@ class PostgresTransaction {
 
     const commandResult = await this.client.query(
       `SELECT c.id, c.user_id, c.bot_id, c.mt5_account_id, c.action, c.symbol, c.lot,
-              c.received_at, c.status, c.lease_token, c.performance_fee_rate
+              c.received_at, c.status, c.lease_token, c.performance_fee_rate,
+              c.performance_fee_exempt
        FROM execution_commands c
        WHERE c.id = $1 AND c.mt5_account_id = $2
        FOR UPDATE`,
@@ -1428,7 +1569,7 @@ class PostgresTransaction {
       const balance = Number(userResult.rows[0].wallet_balance);
       const profitLoss = Number(result.profit_loss || 0);
       const currency = result.profit_loss_currency || 'UNK';
-      if (command.action === 'CLOSE' && currency === 'USD' && profitLoss > 0) {
+      if (performanceFeesEnabled && !command.performance_fee_exempt && command.action === 'CLOSE' && currency === 'USD' && profitLoss > 0) {
         feeDeducted = Math.min(balance, Math.round(profitLoss * Number(command.performance_fee_rate) * 100) / 100);
       }
       if (feeDeducted > 0) {
