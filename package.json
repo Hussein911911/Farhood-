@@ -1,0 +1,29 @@
+{
+  "name": "tradingview-mt5-webhook-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-tenant TradingView webhook service with PostgreSQL persistence and an MT5 Expert Advisor bridge",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "db:migrate": "node scripts/migrate.js",
+    "demo:provision": "node scripts/provision-demo-subscription.js",
+    "telegram:set-webhook": "node scripts/set-telegram-webhook.js",
+    "check:js": "node scripts/check-js.js",
+    "check": "npm run check:js && npm --prefix web run typecheck",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
+  }
+}
